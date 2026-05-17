@@ -690,13 +690,19 @@ A2A 支持 SSE 流式推送任务状态更新。子 Agent 在执行过程中可�
 ```python
 # agents/data_agent/main.py —— 流式任务状态端点
 
+def _sse(event_type: str, data: dict) -> str:
+    """将 type 和 data 格式化为标准 SSE 事件字符串"""
+    payload = {"type": event_type, **data}
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
 @app.get("/tasks/{task_id}/stream")
 async def stream_task(task_id: str):
     """A2A 任务状态流——SSE 端点"""
     async def event_stream():
         task = tasks.get(task_id)
         if not task:
-            yield f"data: {{\"error\": \"task not found\"}}\n\n"
+            yield _sse("error", {"message": "task not found"})
             return
 
         last_status = None
@@ -704,17 +710,17 @@ async def stream_task(task_id: str):
         while task["status"] not in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED):
             if task["status"] != last_status:
                 last_status = task["status"]
-                yield f"data: {{\"type\": \"status_update\", \"task_id\": \"{task_id}\", \"status\": \"{last_status}\"}}\n\n"
+                yield _sse("status_update", {"task_id": task_id, "status": last_status})
             
             # 如果有中间产出，推送
             if task.get("intermediate_artifact"):
-                yield f"data: {{\"type\": \"artifact_update\", \"task_id\": \"{task_id}\", \"artifact\": {json.dumps(task['intermediate_artifact'])}}}\n\n"
+                yield _sse("artifact_update", {"task_id": task_id, "artifact": task['intermediate_artifact']})
                 del task["intermediate_artifact"]
             
             await asyncio.sleep(0.5)
 
         # 最终状态
-        yield f"data: {{\"type\": \"final\", \"task_id\": \"{task_id}\", \"status\": \"{task['status']}\"}}\n\n"
+        yield _sse("final", {"task_id": task_id, "status": task['status']})
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
@@ -891,11 +897,18 @@ async def dispatch_with_deps(subtasks: list[Subtask]) -> list[dict]:
 
 ```python
 # main.py —— 完整的多 Agent 入口
+import json
 from fastapi import FastAPI
 from fastapi.responses import StreamingResponse
 from agents.orchestrator import orchestrator
 
 app = FastAPI()
+
+
+def _sse(event_type: str, data: dict) -> str:
+    """将 type 和 data 格式化为标准 SSE 事件字符串"""
+    payload = {"type": event_type, **data}
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
 @app.post("/v1/report/generate")

@@ -169,7 +169,7 @@ async def _handle_stream(request: ChatRequest) -> StreamingResponse:
         
         try:
             # 发送开始事件（可选，用于前端展示加载状态）
-            yield _sse_event({"type": "start", "session_id": request.session_id})
+            yield _sse("start", {"session_id": request.session_id})
             
             # 从 Redis 读取历史
             history = await cache_get(f"session:{request.session_id}") or []
@@ -190,14 +190,13 @@ async def _handle_stream(request: ChatRequest) -> StreamingResponse:
                     if token:
                         full_reply_parts.append(token)
                         # 逐 token 推送
-                        yield _sse_event({"type": "token", "content": token})
+                        yield _sse("token", {"content": token})
                 
                 # 捕获工具调用开始事件
                 elif kind == "on_tool_start":
                     tool_name = event.get("name", "unknown")
                     logger.info("Agent 调用工具 | session_id=%s | tool=%s", request.session_id, tool_name)
-                    yield _sse_event({
-                        "type": "tool_call",
+                    yield _sse("tool_call", {
                         "tool": tool_name,
                         "status": "start",
                     })
@@ -205,8 +204,7 @@ async def _handle_stream(request: ChatRequest) -> StreamingResponse:
                 # 捕获工具调用结束事件
                 elif kind == "on_tool_end":
                     tool_name = event.get("name", "unknown")
-                    yield _sse_event({
-                        "type": "tool_call",
+                    yield _sse("tool_call", {
                         "tool": tool_name,
                         "status": "end",
                     })
@@ -217,7 +215,7 @@ async def _handle_stream(request: ChatRequest) -> StreamingResponse:
             await cache_set(f"session:{request.session_id}", history, ttl=3600)
             
             # 发送结束事件
-            yield _sse_event({"type": "done", "session_id": request.session_id})
+            yield _sse("done", {"session_id": request.session_id})
             yield "data: [DONE]\n\n"
             
             logger.info("流式对话完成 | session_id=%s | reply_len=%d", request.session_id, len(full_reply))
@@ -225,8 +223,7 @@ async def _handle_stream(request: ChatRequest) -> StreamingResponse:
         except Exception as e:
             logger.exception("流式对话异常 | session_id=%s", request.session_id)
             # 异常也要通过 SSE 通知前端，不能直接抛 500
-            yield _sse_event({
-                "type": "error",
+            yield _sse("error", {
                 "message": "生成过程出现异常，请重试",
                 "code": -99,
             })
@@ -243,9 +240,10 @@ async def _handle_stream(request: ChatRequest) -> StreamingResponse:
     )
 
 
-def _sse_event(data: dict) -> str:
-    """将字典格式化为标准 SSE 事件字符串"""
-    return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+def _sse(event_type: str, data: dict) -> str:
+    """将 type 和 data 格式化为标准 SSE 事件字符串"""
+    payload = {"type": event_type, **data}
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 ```
 
 ### 1.1.6 流式响应的三个关键细节
@@ -958,7 +956,8 @@ async def _handle_stream(request: ChatRequest) -> StreamingResponse:
 
 
 def _sse(event_type: str, data: dict) -> str:
-    return f"data: {json.dumps({"type": event_type, **data}, ensure_ascii=False)}\n\n"
+    payload = {"type": event_type, **data}
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 ```
 
 ---
