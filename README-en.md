@@ -22,6 +22,7 @@ This is a **documentation-only project** focused on core knowledge points of AI 
 - Key module development guides
 - Agent pathways and multi-agent collaboration
 - System testing and deployment verification
+- AI Infra foundation and model selection
 
 > Target audience: Developers with basic programming skills, using the narrative "Industry Standards → Why Schools Don't Teach This → How You Should Code".
 
@@ -40,6 +41,7 @@ cd build_a_product_agent
 # 3. Chapter 3: Module Development (implementation details)
 # 4. Chapter 4: Agent Pathways (single & multi-agent collaboration)
 # 5. Chapter 5: System Testing (pre-deployment testing framework)
+# 6. Chapter 6: AI Infra Foundation (model deployment & selection)
 ```
 
 ---
@@ -78,7 +80,10 @@ docs/
 │       ├── 01-agent-system-testing-methods.md
 │       └── 02-rag-system-testing.md
 │
-└── README.md
+└── 04-production-grade-ai-infra/
+    └── Chapter6-ai-infra-basics/
+        ├── 01-model-infra-basics-and-architecture-selection.md
+        └── 02-model-selection-agent-model-matching.md
 ```
 
 ---
@@ -122,7 +127,14 @@ docs/
 | File                                  | Content                                                                                                                                         |
 | ------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
 | `01-agent-system-testing-methods.md` | Five-dimensional testing framework overview (functionality/quality/security/performance/deployment)                                              |
-| `02-rag-system-testing.md`            | E-commerce customer service example: intent recognition, retrieval recall/precision, generation quality, security, concurrency full链路测试    |
+| `02-rag-system-testing.md`            | E-commerce customer service example: intent recognition, retrieval recall/precision, generation quality, security, concurrency end-to-end test |
+
+### Chapter 6: AI Infra Foundation
+
+| File                                              | Content                                                                         |
+| ------------------------------------------------- | ------------------------------------------------------------------------------- |
+| `01-model-infra-basics-and-architecture-selection.md` | supervisorctl process management, master-slave failover, Docker+K8s, VLLM/SGlang |
+| `02-model-selection-agent-model-matching.md`         | 3D selection framework (params × ecosystem × performance), coding Agent walkthrough |
 
 ---
 
