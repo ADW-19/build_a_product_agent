@@ -1,6 +1,6 @@
 # build_a_product_agent: Building Production-Grade AI Agent
 
-> **Note**: Currently only Chinese version is available. English version release date TBD.
+> **Version Note**: This documentation is created based on the author's hands-on development experience and will be updated from time to time. As the author's native language is Chinese, currently only a Chinese version is available, primarily serving technical professionals in Mainland China, Hong Kong, Macau, Taiwan, Singapore, and other regions. An English version may be considered in the future if there is significant international interest.
 
 > This project is an AI Agent backend development technical manual, systematically explaining how to design and implement production-grade Agent systems from scratch.
 

@@ -1,0 +1,32 @@
+# ===== 环境变量（手册第2章强调：.env 绝不允许入库）=====
+.env
+.env.*
+!.env.example
+
+# ===== 日志 / 临时文件 =====
+*.log
+logs/
+tmp/
+temp/
+*.tmp
+.DS_Store
+Thumbs.db
+
+# ===== 编辑器 / IDE =====
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ===== Python（预留：后续示例代码 / 源码）=====
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+dist/
+build/
+*.egg-info/
