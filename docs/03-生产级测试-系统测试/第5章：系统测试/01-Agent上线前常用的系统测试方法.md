@@ -231,24 +231,23 @@ class TestAgentRouting:
     @pytest.mark.asyncio
     @patch("core.single_agent.llm")
     async def test_agent_stops_after_max_tool_iterations(self, mock_llm):
-        """Agent 调用工具超过次数限制后强制终止"""
-        # 模拟 LLM 连续 5 次都返回 tool_call
-        mock_llm.ainvoke = AsyncMock(side_effect=[
-            AIMessage(content="", tool_calls=[{"name": "t1", "args": {}, "id": "1"}]),
-            AIMessage(content="", tool_calls=[{"name": "t2", "args": {}, "id": "2"}]),
-            AIMessage(content="", tool_calls=[{"name": "t3", "args": {}, "id": "3"}]),
-            AIMessage(content="", tool_calls=[{"name": "t4", "args": {}, "id": "4"}]),
-            AIMessage(content="", tool_calls=[{"name": "t5", "args": {}, "id": "5"}]),
-            AIMessage(content="最终回复"),  # 第 6 次终于给了文本
-        ])
+        """Agent 调用工具超过 recursion_limit 时应抛出 GraphRecursionError"""
+        # 模拟 LLM 一直返回 tool_call，让图循环无法自行结束
+        mock_llm.ainvoke = AsyncMock(return_value=AIMessage(
+            content="", tool_calls=[{"name": "t", "args": {}, "id": "1"}]
+        ))
 
-        result = await agent.ainvoke(
-            {"user_query": "帮我查退款"},
-            config={"configurable": {"thread_id": "test-001"}, "recursion_limit": 6},
-        )
+        # ⚠️ 语义说明：LangGraph 超过 recursion_limit 时抛的是 GraphRecursionError
+        # 异常，而不是"优雅地返回最终回复"。因此测试应断言异常被抛出；
+        # 若按你的图结构调整了 limit（例如单独限制工具调用轮数），
+        # 请按实际行为调整 limit 与断言方式。
+        from langgraph.errors import GraphRecursionError
 
-        # 验证最终有回复
-        assert result["final_response"] is not None
+        with pytest.raises(GraphRecursionError):
+            await agent.ainvoke(
+                {"user_query": "帮我查退款"},
+                config={"configurable": {"thread_id": "test-001"}, "recursion_limit": 6},
+            )
 ```
 
 ### 1.3.3 集成测试——测 Agent 的真实链路
@@ -913,11 +912,20 @@ async def test_concurrent_requests():
         f"失败详情：{error_results[:5]}"
     )
 
-    # 计算百分位延迟
-    n = len(latencies)
-    p50 = latencies[int(n * 0.50)] if n > 0 else 0
-    p95 = latencies[int(n * 0.95)] if n > 0 else 0
-    p99 = latencies[int(n * 0.99)] if n > 0 else 0
+    # 计算百分位延迟（用 nearest-rank 法，避免 int(n*p) 索引与标准分位数差 1 个样本）
+    def percentile(sorted_latencies: list[float], p: float) -> float:
+        """nearest-rank 分位数：返回第 p×100 百分位的取值"""
+        n = len(sorted_latencies)
+        if n == 0:
+            return 0.0
+        import math
+        # 秩 = ceil(p×n)（1-based），转 0-based 索引并夹取到 [0, n-1] 防止越界
+        idx = min(math.ceil(p * n) - 1, n - 1)
+        return sorted_latencies[idx]
+
+    p50 = percentile(latencies, 0.50)
+    p95 = percentile(latencies, 0.95)
+    p99 = percentile(latencies, 0.99)
 
     print(f"\n并发={CONCURRENT_USERS} 延迟分布：P50={p50:.0f}ms P95={p95:.0f}ms P99={p99:.0f}ms")
 
@@ -1279,7 +1287,7 @@ addopts = -m "not (red_team or soak or perf)" --strict-markers
 | **Langfuse** (开源) | 开源版 LangSmith | 不想用 SaaS 的团队 | 可自托管，支持追踪、评估、数据集管理、Prompt 版本管理 |
 | **Braintrust** | 评估专用平台 | 需要严格评估流程的团队 | 支持 LLM-as-Judge、人工评审、A/B 对比、数据集管理 |
 | **Ragas** | RAG 专用评估 | RAG 系统 | 提供 faithfulness、answer_relevancy、context_precision 等专用指标 |
-| **DeepEval** | 开源评估框架 | 通用 Agent 评估 | 提供 20+ 种评估指标，CI/CD 集成友好 |
+| **DeepEval** | 开源评估框架 | 通用 Agent 评估 | 提供 14+ 种评估指标，CI/CD 集成友好 |
 | **promptfoo** | Prompt 评估 | 对比不同 prompt/模型 | 命令行工具，轻量级，适合快速对比 |
 
 ### 1.9.2 各框架适用场景

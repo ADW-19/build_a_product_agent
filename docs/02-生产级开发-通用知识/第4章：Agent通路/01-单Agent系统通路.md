@@ -87,6 +87,10 @@ class AgentState(TypedDict):
     # 工具调用控制
     available_tools: list[str]           # 当前节点可用的工具名列表
 
+    # 内部动态标记（下划线开头，节点之间传递的中间判断）
+    # 显式声明，避免类型检查报"未声明的字段"错误
+    _need_rag: bool                      # 是否需要 RAG 检索（由 node_classify_intent 写入）
+
     # 最终输出
     final_response: str
 
@@ -319,39 +323,39 @@ agent = build_single_agent(
 
 ---
 
-## 1.2 单 Agent 的执行时序：一个完整请求的 12 步
+## 1.2 单 Agent 的执行时序：一个完整请求的 8 步
 
 ```
 时间线（用户："帮我查一下上周那笔退款到账了没"）
 
  0ms  │  用户请求到达
       │
- 50ms │  ① classify_intent    → intent=action, need_tools=true, need_rag=false
+ 20ms │  ① classify_intent    → intent=action, need_tools=true, need_rag=false
       │                          （"查退款"是操作，不是提问，不需要 RAG）
       │
- 100ms│  ② load_memories      → 短期：刚才聊到蓝牙耳机退款
+ 60ms │  ② load_memories      → 短期：刚才聊到蓝牙耳机退款
       │                          → 长期：用户是 VIP，偏好简洁回复
       │                          → 长期：用户最近有一笔订单 ORD-88483
       │
- 150ms│  ③ route: need_rag=false → 跳过 search_rag
+ 80ms │  ③ route: need_rag=false → 跳过 search_rag
       │
- 160ms│  ④ assemble_context    → 组装 system prompt + 长期记忆 + 短期记忆 + query
+ 100ms│  ④ assemble_context    → 组装 system prompt + 长期记忆 + 短期记忆 + query
       │                          system prompt 包含：可用工具 = [order_tool]
       │
  200ms│  ⑤ llm_reason (第1次)  → LLM 决定调 order_tool(action="search", order_id="ORD-88483")
       │
- 250ms│  ⑥ tools               → 执行 order_tool → 返回"订单 ORD-88483：退款 299 元，状态：处理中，
+ 230ms│  ⑥ tools               → 执行 order_tool → 返回"订单 ORD-88483：退款 299 元，状态：处理中，
       │                          预计 3 个工作日内到账"
       │
- 300ms│  ⑦ llm_reason (第2次)  → LLM 看到工具结果，决定不再调工具，生成回复
+ 330ms│  ⑦ llm_reason (第2次)  → LLM 看到工具结果，决定不再调工具，生成回复
       │                          "您的退款 299 元正在处理中，预计 3 个工作日内原路退回。"
       │
- 320ms│  ⑧ generate_final      → 提取最终回复
+ 340ms│  ⑧ generate_final      → 提取最终回复
       │
  350ms│  → 返回给用户
 ```
 
-**总耗时约 350ms（不含 LLM 推理时间）。** 其中 LLM 两次推理（⑤和⑦）占了大头，实际耗时取决于模型速度。其他节点（①~④、⑥、⑧）都在 50ms 以内。
+**总耗时约 350ms。** 其中两次 LLM 推理（⑤和⑦）占了大头（每条约 100ms，实际取决于模型速度）；其余节点（①~④、⑥、⑧）都是固定开销，单步在 50ms 以内。
 
 ---
 
@@ -375,30 +379,34 @@ Agent 推理 → 调用 send_email(
 
 ### 1.3.2 LangGraph 的 interrupt 机制
 
-LangGraph 提供了 `interrupt_before` 参数，在指定节点执行前暂停整个工作流，等待外部输入：
+LangGraph 提供两种"暂停"机制，容易混淆，先分清：
+
+1. **`compile(interrupt_before=[...])`（节点前暂停）**：编译时声明在哪些节点执行前暂停。运行时工作流会在该节点前停住并**正常返回状态快照（不抛异常）**，State 已保存到 checkpointer；恢复时用同一个 `thread_id` 再调用 `agent.ainvoke(None)` 即可。
+2. **`interrupt()`（节点内暂停）**：只有节点内部调用 `interrupt()` 函数时，才会抛出 `GraphInterrupt` 异常，把控制权交回外部循环。适用于"执行到一半需要人来拍板"的动态场景。
+
+本章主推第一种（`interrupt_before`），因为它把"哪些节点需要确认"集中声明在编译参数里，结构清晰。下面的示例展示"读取状态 + 恢复执行"这套 API：
 
 ```python
-# 构建时指定哪些节点需要人工确认
+# 注意：build_single_agent 本身没有配置 interrupt_before，
+# 下面的示例只能演示读取/恢复状态的 API 用法；
+# 真正带中断的图在 1.3.4（中断点设在 human_approval 节点前）。
 agent = build_single_agent(
     checkpointer=RedisSaver.from_conn_string("redis://localhost:6379/2"),
 )
 
 # ============ 运行时 ============
 
-# 1. 正常执行，但在 tools 节点前暂停（如果上一个节点是 llm_reason）
-#    使用 interrupt_before 参数
+# 1. 正常执行。若 graph 在 compile 时配了 interrupt_before，
+#    执行到中断点时会【正常返回状态快照】（不抛异常），
+#    State 保存到 checkpointer，等外部用同一个 thread_id 恢复。
 config = {"configurable": {"thread_id": session_id}}
 
-# 第一次调用：执行到 tools 节点前自动暂停
 result = await agent.ainvoke(
     {"user_query": "帮我给全公司发邮件通知明天放假", ...},
     config=config,
 )
 
-# → LangGraph 抛出 GraphInterrupt 异常（或返回特殊状态）
-# → 工作流暂停，State 保存到 checkpointer
-
-# 2. 此时可以从 State 中查看 Agent 打算做什么
+# 2. 读取当前 State（若在中断点暂停，这里能看到 Agent 打算执行的 tool_calls）
 current_state = await agent.aget_state(config)
 pending_tool_calls = current_state.values["messages"][-1].tool_calls
 print(f"Agent 想要执行：{pending_tool_calls}")
@@ -407,7 +415,7 @@ print(f"Agent 想要执行：{pending_tool_calls}")
 # 3. 人工审核：展示给用户确认
 # 前端弹窗："Agent 想要发送邮件给全公司，确认吗？"
 
-# 4a. 用户点"确认" → 恢复执行
+# 4a. 用户点"确认" → 用同一个 thread_id 恢复执行
 await agent.aupdate_state(
     config,
     {"human_approved": True},   # 注入审批结果
@@ -452,12 +460,18 @@ def route_tool_approval(state: AgentState) -> str:
     """
     工具执行前的审批路由。
     
-    READ  → 直接执行
-    WRITE → 检查用户是否已授权（首次 WRITE 时需确认，后续同会话可放行）
-    DANGEROUS → 每次都必须确认
+    - LLM 返回纯文本（没有 tool_calls）→ 这就是最终回复，走 generate_final
+      （否则会被路由回 tools，ToolNode 无工具可执行，再回到 llm_reason → 死循环）
+    - READ  → 直接执行
+    - WRITE → 检查用户是否已授权（首次 WRITE 时需确认，后续同会话可放行）
+    - DANGEROUS → 每次都必须确认
     """
     last_message = state["messages"][-1]
     tool_calls = last_message.tool_calls
+
+    # 纯文本回复 → 直接生成最终回答
+    if not tool_calls:
+        return "generate_final"
 
     for tc in tool_calls:
         risk = TOOL_RISK_MAP.get(tc["name"], ToolRiskLevel.DANGEROUS)
@@ -487,10 +501,13 @@ def build_agent_with_approval():
 
     # 新增：人工审批节点
     async def node_human_approval(state: AgentState) -> dict:
-        """人工审批节点。此节点不会真正被'执行'，而是通过 interrupt 暂停。"""
-        # 这个函数体不会运行（因为 graph 在这之前就 interrupt 了）
-        # 但还是返回空更新满足类型要求
-        return {}
+        """
+        人工审批节点。
+
+        interrupt_before 恢复时，这个节点【会被真正执行】——
+        只不过它返回空更新 {}，没有任何副作用，所以看起来"像没执行"。
+        """
+        return {}  # 空更新：只作为"审批通过"的汇合点，不改动 State
 
     graph.add_node("human_approval", node_human_approval)
 
@@ -602,7 +619,9 @@ Plan-and-Execute 模式（先计划）：
 from typing import TypedDict, Annotated
 from operator import add
 from pydantic import BaseModel, Field
+from langchain_openai import ChatOpenAI
 from langgraph.graph import StateGraph, END
+from langgraph.prebuilt import ToolNode
 
 
 # ==================== 计划的数据结构 ====================
@@ -686,6 +705,9 @@ async def node_execute_step(state: PlanAndExecuteState) -> dict:
     if step is None:
         return {"final_output": "所有步骤已完成"}
 
+    # 说明：本示例按 step_id 顺序执行；生产实现应把计划按 depends_on 做拓扑排序，
+    # 只有前置步骤完成后才调度后续步骤（可参考第二章 2.5.3 的依赖调度）。
+
     # 收集前置步骤的结果
     deps_context = ""
     if step.depends_on:
@@ -713,17 +735,39 @@ async def node_execute_step(state: PlanAndExecuteState) -> dict:
 
     messages = [{"role": "user", "content": execute_prompt}]
 
-    # 绑定工具
-    execute_llm = llm.bind_tools([t for t in ALL_TOOLS if t.name == step.tool_name or step.tool_name == ""])
+    # ===== 内嵌 ReAct：一个步骤内部也要"思考→调工具→观察→再思考" =====
+    # 注意：不能在节点外只 bind_tools 就完事——图里没有 ToolNode，
+    # 一旦 LLM 返回 tool_calls，response.content 会是空的，工具也永远不会执行。
+    # 正确做法：在节点内部做一轮 ReAct，LLM 要调工具就执行工具，
+    # 把 ToolMessage 回填后再让 LLM 继续，直到 LLM 返回纯文本为止。
+    step_tools = [t for t in ALL_TOOLS if not step.tool_name or t.name == step.tool_name]
+    execute_llm = llm.bind_tools(step_tools)
+    tool_node = ToolNode(step_tools)
 
-    response = await execute_llm.ainvoke(messages)
+    response = None
+    for _ in range(5):  # 最多内嵌 5 轮 ReAct，防止死循环
+        response = await execute_llm.ainvoke(messages)
+        messages.append(response)
+
+        # LLM 返回 tool_calls → 执行工具，把 ToolMessage 回填到消息里
+        if getattr(response, "tool_calls", None):
+            tool_output = await tool_node.ainvoke({"messages": [response]})
+            messages.extend(tool_output["messages"])
+            continue
+
+        # LLM 返回纯文本 → 这就是该步骤的结果，跳出循环
+        break
+
+    # 极端情况：若 5 轮全是 tool_calls，可把最后一轮的 ToolMessage 当结果；
+    # 教学示例只演示标准路径——LLM 返回纯文本即视为步骤完成。
+    result_text = response.content if (response is not None and response.content) else ""
 
     return {
-        "messages": [response],
+        "messages": messages,
         "completed_steps": [{
             "step_id": current,
             "description": step.description,
-            "result": response.content,
+            "result": result_text,
             "status": "completed",
         }],
     }

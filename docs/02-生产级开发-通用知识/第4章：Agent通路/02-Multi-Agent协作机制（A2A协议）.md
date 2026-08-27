@@ -2,6 +2,8 @@
 
 > **核心论点**：单 Agent 能解决 80% 的问题，剩下 20% 需要多 Agent 协作——任务太复杂、专业领域太多、单一 prompt 无法兼顾多种能力。但多 Agent 不是"多启几个进程就行"，真正的挑战在于 Agent 之间的能力发现、任务委托、状态同步和异常协调。A2A 协议把这些标准化了。本章从架构模式到代码实现，完整拆解多 Agent 协作的工程方法。
 
+> **背景**：A2A（Agent2Agent，Agent 到 Agent）是 Google 发起、2025 年移交给 Linux 基金会托管的开放协议，目标是让不同厂商、不同技术栈的 Agent 之间能够互相发现能力、委托任务、同步状态。它和 MCP（Model Context Protocol，解决 **Agent ↔ 工具** 的连接）不同——A2A 解决的是 **Agent ↔ Agent** 的互操作问题，可以理解为"Agent 世界的 HTTP"。
+
 ---
 
 ## 2.1 为什么需要多 Agent
@@ -141,6 +143,8 @@ Supervisor 的递归版本。每个子 Agent 本身也可以是一个 Supervisor
 
 ## 2.3 A2A 协议的核心概念
 
+> **核心模型：Client 与 Agent 双角色。** A2A 的每一次交互都分为两方：**Client**（发起方，负责发请求、收结果）与 **Agent**（执行方，负责完成任务）。这个角色不是固定的——主管 Agent 对下面的子 Agent 来说是 Client，但如果它自己需要调用别的 Agent 的能力，它又会变成 Client。换言之，任何 Agent 都可以随时以 Client 身份去请求另一个 Agent。在本章的 Supervisor 架构里：**主管 Agent（编排方）= Client，数据/文档等子 Agent = 远端 Agent（执行方）**。
+
 ### 2.3.1 A2A 解决什么问题
 
 在没有 A2A 之前，多 Agent 通信基本靠"硬编码 HTTP 调用"——Agent A 知道 Agent B 的 URL、知道 B 能干什么、知道 B 的输入输出格式——全是写死的。
@@ -162,117 +166,150 @@ A2A 把以下四件事标准化了：
 {
   "name": "数据分析 Agent",
   "description": "查询数据库、执行统计分析、生成数据报告",
-  "url": "http://data-agent:8001",
+  "url": "http://data-agent:8001/",
+  "protocolVersion": "0.2.0",
   "version": "1.0.0",
   "capabilities": {
     "streaming": true,
     "pushNotifications": false
   },
+  "defaultInputModes": ["text"],
+  "defaultOutputModes": ["text"],
   "skills": [
     {
       "id": "sql_query",
       "name": "SQL 查询",
       "description": "执行 SQL 查询并返回结构化数据。支持 PostgreSQL 和 MySQL。",
       "tags": ["database", "query", "sql"],
-      "inputSchema": {
-        "type": "object",
-        "properties": {
-          "query": {"type": "string", "description": "SQL 查询语句"},
-          "database": {"type": "string", "enum": ["postgresql", "mysql"]}
-        },
-        "required": ["query"]
-      },
-      "outputSchema": {
-        "type": "object",
-        "properties": {
-          "columns": {"type": "array"},
-          "rows": {"type": "array"},
-          "row_count": {"type": "integer"}
-        }
-      }
+      "examples": ["SELECT * FROM orders WHERE status = 'pending'"]
     },
     {
       "id": "data_analysis",
       "name": "数据分析",
       "description": "对数据进行统计分析：均值、中位数、同比、环比、趋势预测",
-      "tags": ["analysis", "statistics", "forecast"],
-      "inputSchema": {
-        "type": "object",
-        "properties": {
-          "data": {"type": "object", "description": "待分析的结构化数据"},
-          "analysis_type": {"type": "string", "enum": ["summary", "trend", "compare", "forecast"]}
-        }
-      }
+      "tags": ["analysis", "statistics", "forecast"]
     }
   ],
   "authentication": {
-    "type": "bearer_token"
+    "schemes": [
+      {"scheme": "bearer"}
+    ]
   },
-  "rateLimit": {
-    "maxRequestsPerMinute": 60
-  }
+  "rateLimits": [
+    {
+      "name": "default",
+      "limit": 60,
+      "windowSeconds": 60
+    }
+  ]
 }
 ```
+
+> **注意**：A2A 的 Skill 字段只有 `id`、`name`、`description`、`tags`、`examples`、`inputModes`、`outputModes`，**没有 `inputSchema`/`outputSchema`**；调用参数是放进任务的 `message`（Part）里传给 Agent 的，而不是在 Agent Card 里声明 JSON Schema。`rateLimit` 在规范里是复数 `rateLimits`（数组）；认证信息用 `authentication.schemes[]` 描述。
 
 ### 2.3.3 Task 生命周期
 
 A2A 中一切工作都以 Task 为单位管理：
 
 ```
-                    ┌──────────┐
-                    │ submitted │  ← Agent B 收到任务
-                    └────┬─────┘
-                         │
-                    ┌────▼─────┐
-                    │  working  │  ← Agent B 开始执行（可推送中间状态）
-                    └────┬─────┘
-                         │
-              ┌──────────┼──────────┐
-              │                     │
-         ┌────▼─────┐         ┌────▼─────┐
-         │ completed │         │  failed   │
-         └──────────┘         └────┬─────┘
-                                   │
-                              ┌────▼─────┐
-                              │ cancelled │  ← Agent A 主动取消
-                              └──────────┘
+                    ┌──────────────┐
+                    │  submitted   │  ← 远端 Agent 收到任务
+                    └──────┬───────┘
+                           │
+                    ┌──────▼───────┐
+                    │   working    │  ← 远端 Agent 开始执行（可推送中间状态）
+                    └──────┬───────┘
+                           │
+              ┌────────────┼─────────────────────┐
+              │            │                     │
+       ┌──────▼──────┐  ┌──▼────────────┐   ┌────▼──────┐
+       │ completed   │  │ input-required│   │  failed   │
+       └─────────────┘  └──────┬────────┘   └───────────┘
+        （终态）                │              （终态）
+                               │  Client 补充输入/澄清后
+                               │  通过 tasks/send 恢复 → working
+                               ▼
+                        ┌──────────────┐
+                        │   working    │  ← 恢复执行
+                        └──────┬───────┘
+                               │
+                         ┌─────▼───────┐
+                         │  canceled   │  ← Client 主动取消（终态）
+                         └─────────────┘
 ```
+
+> **要点**：
+> - **`input-required`** 是 A2A 的核心状态——Agent 在执行中向调用方（Client）索取更多输入/澄清。它**不是终态**：Client 补充信息后通过 `tasks/send` 恢复，任务回到 `working` 继续执行。
+> - 终态只有三个：**`completed` / `failed` / `canceled`**。
+> - 拼写注意：A2A 规范用的是 **`canceled`（单个 L）**，不是 `cancelled`。
 
 每个 Task 的核心数据结构：
 
 ```python
 from pydantic import BaseModel, Field
 from typing import Optional, Literal
-from uuid import UUID, uuid4
-from datetime import datetime
+from uuid import uuid4
 
 
-class TaskStatus(str):
+class TaskState(str):
+    """A2A Task 状态机枚举"""
     SUBMITTED = "submitted"
     WORKING = "working"
-    COMPLETED = "completed"
-    FAILED = "failed"
-    CANCELLED = "cancelled"
+    INPUT_REQUIRED = "input-required"   # 核心状态：Agent 向调用方索取更多输入/澄清（非终态）
+    COMPLETED = "completed"             # 终态
+    FAILED = "failed"                   # 终态
+    CANCELED = "canceled"               # 终态（注意：A2A 规范拼写为单个 L，不是 cancelled）
+
+
+class TaskStatus(BaseModel):
+    """Task 的状态对象——state 是对象字段，不是裸字符串"""
+    state: TaskState
+    message: Optional[str] = None       # 人类可读的状态说明
+    errorCode: Optional[str] = None     # 失败/取消时的错误码
+
+
+class TextPart(BaseModel):
+    type: Literal["text"] = "text"
+    text: str
+
+
+class FilePart(BaseModel):
+    type: Literal["file"] = "file"
+    file: dict  # {"name": ..., "mimeType": ..., "uri": ...} 或 bytes
+
+
+class DataPart(BaseModel):
+    type: Literal["data"] = "data"
+    data: dict
+
+
+Part = TextPart | FilePart | DataPart
+
+
+class Message(BaseModel):
+    """A2A 对话消息：role + parts（内容用 Part 承载，而不是裸字符串）"""
+    role: Literal["user", "agent"]
+    parts: list[Part]
+    metadata: dict = Field(default_factory=dict)
 
 
 class Artifact(BaseModel):
-    """任务产出物"""
-    parts: list[dict]  # 每个 part 可以是 text/image/file/data
+    """任务产出物——与 Message 共用 Part 类型"""
+    parts: list[Part]
+    metadata: dict = Field(default_factory=dict)
 
 
 class Task(BaseModel):
+    """A2A Task 核心数据结构：{id, sessionId, status, artifact, history, metadata}"""
     id: str = Field(default_factory=lambda: str(uuid4()))
-    session_id: str                                    # 关联的会话 ID
-    title: str                                         # 任务标题
-    description: str                                   # 任务详细描述
-    context: dict = Field(default_factory=dict)         # 上下文数据
-    status: str = TaskStatus.SUBMITTED
-    assigned_agent: str = ""                           # 被分配给的 Agent 名称
+    sessionId: str                                      # 关联的会话 ID（camelCase）
+    status: TaskStatus = Field(default_factory=lambda: TaskStatus(state=TaskState.SUBMITTED))
     artifact: Optional[Artifact] = None                 # 产出物
-    error: Optional[str] = None
-    created_at: str = Field(default_factory=lambda: datetime.now().isoformat())
-    updated_at: str = Field(default_factory=lambda: datetime.now().isoformat())
+    history: list[Message] = Field(default_factory=list)  # 任务相关的对话历史
+    metadata: dict = Field(default_factory=dict)        # 扩展信息（原 title/description/context 等可放这里）
 ```
+
+> **注意**：A2A 的 Task 没有 `title`/`description`/`context`/`assigned_agent` 这些字段——任务要表达的内容放在 `history` 里的 `Message`（role + parts）中，额外的业务上下文（如"这个任务来自哪个用户""要查询哪个数据库"）放进 `metadata`。字段命名遵循 A2A 的 camelCase：`sessionId` 而不是 `session_id`。
 
 ---
 
@@ -290,46 +327,48 @@ class Task(BaseModel):
                     └───────┬────────┘
                             │
                             ▼
-                    ┌────────────────┐
-                    │  主管 Agent     │
-                    │  (Orchestrator) │
-                    │                │
-                    │  能力：         │
-                    │  1. 理解意图    │
-                    │  2. 拆分任务    │
-                    │  3. 分配Agent   │
-                    │  4. 汇总结果    │
-                    └──┬───┬───┬─────┘
-                       │   │   │
-           ┌───────────┘   │   └───────────┐
-           ▼               ▼               ▼
-    ┌────────────┐ ┌────────────┐ ┌────────────┐
-    │ 数据 Agent  │ │ 文档 Agent  │ │ 通用 Agent  │
-    │ :8001      │ │ :8002      │ │ :8003      │
-    │            │ │            │ │            │
-    │ Agent Card │ │ Agent Card │ │ Agent Card  │
-    │ /.well-    │ │ /.well-    │ │ /.well-     │
-    │ known/     │ │ known/     │ │ known/      │
-    │ agent.json │ │ agent.json │ │ agent.json  │
-    └────────────┘ └────────────┘ └────────────┘
+      ┌──────────────────────────────────────┐
+      │  主管 Agent（Orchestrator）            │
+      │  = A2A 中的 Client（发起方）            │
+      │  能力：理解意图 / 拆分任务 / 分配 / 汇总  │
+      └──┬─────────────┬─────────────┬───────┘
+         │             │             │
+         │  Agent Card 里的 url → 子 Agent 的单个 JSON-RPC 端点
+         │  方法：tasks/send、tasks/get、tasks/cancel（JSON-RPC 2.0 over HTTP）
+         │             │             │
+         ▼             ▼             ▼
+   ┌────────────┐ ┌────────────┐ ┌────────────┐
+   │ 数据 Agent  │ │ 文档 Agent  │ │ 通用 Agent  │
+   │ = 远端 Agent│ │ = 远端 Agent│ │ = 远端 Agent│
+   │ 单 JSON-RPC │ │ 单 JSON-RPC│ │ 单 JSON-RPC│
+   │ 端点 :8001  │ │ 端点 :8002 │ │ 端点 :8003 │
+   │ Agent Card │ │ Agent Card │ │ Agent Card │
+   └────────────┘ └────────────┘ └────────────┘
 ```
 
 ### 2.4.2 Agent Card 服务端实现
 
-每个子 Agent 是一个独立的 FastAPI 服务，对外暴露 Agent Card 和 Task 端点：
+每个子 Agent 是一个独立的 FastAPI 服务，对外暴露 **Agent Card 端点**（能力发现）和 **单个 JSON-RPC 端点**（方法分发）：
 
 ```python
 # agents/data_agent/main.py —— 数据分析 Agent 服务
-from fastapi import FastAPI
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel
-from uuid import uuid4
+# ============================================================
+# A2A 基于 JSON-RPC 2.0 over HTTP(S)，【不是 REST】。
+# 没有 POST /tasks、GET /tasks/{id} 这类资源路径——
+# 所有方法都通过 Agent Card 里 url 指向的【单个 JSON-RPC 端点】调用，
+# 靠请求体里的 method 字段区分：tasks/send、tasks/get、tasks/cancel ...
+# ============================================================
 import asyncio
+from datetime import datetime
+from uuid import uuid4
+
+from fastapi import FastAPI
+from pydantic import BaseModel
 
 app = FastAPI(title="数据分析 Agent")
 
 
-# ============ Agent Card 端点 ============
+# ============ Agent Card 端点（能力发现） ============
 
 @app.get("/.well-known/agent.json")
 async def get_agent_card():
@@ -337,23 +376,18 @@ async def get_agent_card():
     return {
         "name": "数据分析 Agent",
         "description": "查询数据库、执行统计分析、生成数据报告",
-        "url": "http://data-agent:8001",
+        "url": "http://data-agent:8001/",   # ← JSON-RPC 端点（唯一入口）
+        "protocolVersion": "0.2.0",
         "version": "1.0.0",
         "capabilities": {"streaming": True},
+        "defaultInputModes": ["text"],
+        "defaultOutputModes": ["text"],
         "skills": [
             {
                 "id": "sql_query",
                 "name": "SQL 查询",
                 "description": "执行 SQL 查询并返回结构化数据",
                 "tags": ["database", "query"],
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "query": {"type": "string"},
-                        "params": {"type": "object"},
-                    },
-                    "required": ["query"],
-                },
             },
             {
                 "id": "data_analysis",
@@ -362,110 +396,196 @@ async def get_agent_card():
                 "tags": ["analysis", "statistics"],
             },
         ],
+        "authentication": {"schemes": [{"scheme": "bearer"}]},
     }
 
 
-# ============ Task 端点（A2A 核心） ============
+# ============ 单 JSON-RPC 端点（A2A 核心） ============
 
 # 内存任务存储（生产环境用 Redis）
 tasks: dict[str, dict] = {}
 
 
-class TaskSendRequest(BaseModel):
-    id: str
-    session_id: str
-    title: str
-    description: str
-    context: dict = {}
-    skill_id: str = ""  # 要求使用的技能 ID
+class JsonRpcRequest(BaseModel):
+    jsonrpc: str = "2.0"
+    id: str                        # 请求 ID（响应里原样返回）
+    method: str                    # 方法名：{category}/{action}，如 tasks/send
+    params: dict = {}
 
 
-@app.post("/tasks")
-async def create_task(request: TaskSendRequest):
+class RpcError(Exception):
+    """携带 JSON-RPC 错误码的异常"""
+    def __init__(self, code: int, message: str):
+        self.code, self.message = code, message
+
+
+def rpc_result(rpc_id: str, result: dict) -> dict:
+    """JSON-RPC 2.0 成功响应：{"jsonrpc":"2.0","id":"1","result":{...}}"""
+    return {"jsonrpc": "2.0", "id": rpc_id, "result": result}
+
+
+def rpc_error(rpc_id: str, code: int, message: str) -> dict:
+    """JSON-RPC 2.0 错误响应：{"jsonrpc":"2.0","id":"1","error":{...}}"""
+    return {"jsonrpc": "2.0", "id": rpc_id, "error": {"code": code, "message": message}}
+
+
+@app.post("/")
+async def json_rpc_endpoint(req: JsonRpcRequest):
     """
-    A2A 任务提交端点。
-    
-    主管 Agent 调用此端点，向本 Agent 提交一个任务。
-    返回任务 ID，后续主管可以通过 GET /tasks/{id} 查询状态。
+    A2A 唯一的 JSON-RPC 端点。
+
+    主管 Agent（Client）用 HTTP POST 把
+    {"jsonrpc": "2.0", "id": "1", "method": "tasks/send", "params": {...}}
+    发到这里，由 method 字段分发到对应处理函数。
     """
+    try:
+        handlers = {
+            "agent/getAgentCard": _handle_get_agent_card,
+            "tasks/send": _handle_tasks_send,
+            "tasks/get": _handle_tasks_get,
+            "tasks/cancel": _handle_tasks_cancel,
+        }
+        handler = handlers.get(req.method)
+        if handler is None:
+            raise RpcError(-32601, f"未知方法: {req.method}")  # Method not found
+        result = await handler(req.params)
+        return rpc_result(req.id, result)
+    except RpcError as e:
+        return rpc_error(req.id, e.code, e.message)
+
+
+async def _handle_get_agent_card(params: dict) -> dict:
+    """agent/getAgentCard —— 返回本 Agent 的 Agent Card"""
+    return await get_agent_card()
+
+
+async def _handle_tasks_send(params: dict) -> dict:
+    """
+    tasks/send —— 提交任务（Client 用；对应老 REST 写法里的 POST /tasks）
+
+    与 REST 不同，这里不创建新的 URL 路径，
+    而是返回一个 Task 对象，内含 id 和初始状态 submitted。
+    """
+    task_id = params.get("id") or str(uuid4())
     task = {
-        "id": request.id,
-        "session_id": request.session_id,
-        "title": request.title,
-        "description": request.description,
-        "context": request.context,
-        "skill_id": request.skill_id,
-        "status": TaskStatus.SUBMITTED,
+        "id": task_id,
+        "sessionId": params.get("sessionId", ""),
+        "status": {"state": "submitted"},
         "artifact": None,
+        "history": [],
+        "metadata": params.get("metadata", {}),
+        "skill_id": params.get("skill_id", ""),   # 教学用：本次任务要用的技能
         "created_at": datetime.now().isoformat(),
     }
-    tasks[request.id] = task
+    tasks[task_id] = task
 
-    # 异步执行任务（不阻塞返回）
-    asyncio.create_task(_execute_task(request.id))
-
-    return {"task_id": request.id, "status": "submitted"}
+    asyncio.create_task(_execute_task(task_id))   # 异步执行，不阻塞返回
+    return _task_to_dict(task)
 
 
-@app.get("/tasks/{task_id}")
-async def get_task(task_id: str):
-    """A2A 任务状态查询端点"""
-    task = tasks.get(task_id)
+async def _handle_tasks_get(params: dict) -> dict:
+    """tasks/get —— 查询任务状态（对应老 REST 写法里的 GET /tasks/{id}）"""
+    task = tasks.get(params.get("id"))
     if not task:
-        return JSONResponse({"error": "task not found"}, status_code=404)
+        raise RpcError(-32000, f"任务不存在: {params.get('id')}")
+    return _task_to_dict(task)
 
+
+async def _handle_tasks_cancel(params: dict) -> dict:
+    """tasks/cancel —— 取消任务（对应老 REST 写法里的 POST /tasks/{id}/cancel）"""
+    task = tasks.get(params.get("id"))
+    if not task:
+        raise RpcError(-32000, f"任务不存在: {params.get('id')}")
+    if task["status"]["state"] in ("completed", "failed", "canceled"):
+        raise RpcError(-32000, "任务已处于终态，无法取消")
+    task["status"] = {"state": "canceled"}
+    return _task_to_dict(task)
+
+
+def _task_to_dict(task: dict) -> dict:
+    """返回 A2A 规范形状的 Task 对象（只暴露协议字段）"""
     return {
-        "task_id": task["id"],
+        "id": task["id"],
+        "sessionId": task["sessionId"],
         "status": task["status"],
         "artifact": task.get("artifact"),
-        "error": task.get("error"),
+        "history": task.get("history", []),
+        "metadata": task.get("metadata", {}),
     }
-
-
-@app.post("/tasks/{task_id}/cancel")
-async def cancel_task(task_id: str):
-    """A2A 任务取消端点"""
-    task = tasks.get(task_id)
-    if not task:
-        return JSONResponse({"error": "task not found"}, status_code=404)
-
-    if task["status"] in (TaskStatus.COMPLETED, TaskStatus.FAILED):
-        return {"error": "task already completed or failed"}
-
-    task["status"] = TaskStatus.CANCELLED
-    return {"task_id": task_id, "status": "cancelled"}
 
 
 # ============ 任务执行逻辑 ============
 
 async def _execute_task(task_id: str):
-    """后台执行任务"""
+    """后台执行任务（教学简化：仅演示状态流转）"""
     task = tasks[task_id]
-    task["status"] = TaskStatus.WORKING
+    task["status"] = {"state": "working"}
 
     try:
         if task["skill_id"] == "sql_query":
-            result = await _execute_sql_query(task["description"], task["context"])
+            result = await _execute_sql_query(task["metadata"], task["sessionId"])
         elif task["skill_id"] == "data_analysis":
-            result = await _execute_analysis(task["description"], task["context"])
+            result = await _execute_analysis(task["metadata"], task["sessionId"])
         else:
             # 通用 LLM 处理（子 Agent 内部的 LLM 推理）
-            result = await _execute_with_llm(task["description"], task["context"])
+            result = await _execute_with_llm(task["metadata"], task["sessionId"])
 
-        task["status"] = TaskStatus.COMPLETED
+        task["status"] = {"state": "completed"}
         task["artifact"] = {"parts": [{"type": "text", "text": result}]}
 
     except Exception as e:
-        task["status"] = TaskStatus.FAILED
-        task["error"] = str(e)
+        task["status"] = {"state": "failed", "message": str(e)}
+
+
+# 教学用简化实现——生产环境替换为真实数据库 / LLM 调用
+async def _execute_sql_query(metadata: dict, session_id: str) -> str:
+    return "查询结果：Q2 销售额 128 万，环比 +12.5%"
+
+
+async def _execute_analysis(metadata: dict, session_id: str) -> str:
+    return "分析完成：增长最快的品类是智能穿戴（+31%）"
+
+
+async def _execute_with_llm(metadata: dict, session_id: str) -> str:
+    return "通用推理完成（此处应调用子 Agent 内部的 LLM）"
 ```
 
 ### 2.4.3 主管 Agent 的实现
 
-主管 Agent 的核心逻辑：解析任务 → 发现子 Agent 能力 → 分配任务 → 等待结果 → 汇总。
+主管 Agent 的核心逻辑：解析任务 → 发现子 Agent 能力 → 分配任务 → 等待结果 → 汇总。在 A2A 中，主管 Agent 扮演 **Client** 角色，通过 JSON-RPC 调用子 Agent（远端 Agent）的单个端点。
+
+先看一个最简单的 Client 视角调用（与 2.4.2 的服务端一一对应）：
 
 ```python
-# agents/orchestrator/main.py
+# Client 视角：一个最简单的 JSON-RPC 调用（httpx）
+import httpx
+
+resp = await httpx.post(
+    "http://data-agent:8001/",            # ← Agent Card 里 url 指向的单个端点
+    json={
+        "jsonrpc": "2.0",
+        "id": "1",                        # 请求 ID，响应里原样返回
+        "method": "tasks/send",           # 方法名 {category}/{action}
+        "params": {
+            "id": "subtask-1",
+            "sessionId": "sess-001",
+            "skill_id": "sql_query",
+            "metadata": {"title": "查Q2销售", "description": "查询 Q2 销售数据"},
+        },
+    },
+)
+print(resp.json())
+# → {"jsonrpc":"2.0","id":"1","result":{
+#      "id":"subtask-1","sessionId":"sess-001",
+#      "status":{"state":"submitted"},
+#      "artifact":null,"history":[],"metadata":{...}}}
+```
+
+下面是完整的主管 Agent：
+
+```python
+# agents/orchestrator/main.py —— 主管 Agent（A2A 中的 Client）
+import asyncio
 import httpx
 from typing import TypedDict
 from pydantic import BaseModel
@@ -497,24 +617,52 @@ class SubtaskList(BaseModel):
 # ==================== 能力注册表 ====================
 
 # 生产环境：从各 Agent 的 /.well-known/agent.json 动态获取
-# 开发环境：静态注册表
+# 开发环境：静态注册表（注意 url 是 Agent Card 里指向的 JSON-RPC 端点）
 AGENT_REGISTRY = {
     "data-agent": {
         "name": "数据分析 Agent",
-        "url": "http://data-agent:8001",
+        "url": "http://data-agent:8001/",
         "skills": ["sql_query", "data_analysis"],
     },
     "doc-agent": {
         "name": "文档 Agent",
-        "url": "http://doc-agent:8002",
+        "url": "http://doc-agent:8002/",
         "skills": ["search_kb", "generate_report"],
     },
     "general-agent": {
         "name": "通用 Agent",
-        "url": "http://general-agent:8003",
+        "url": "http://general-agent:8003/",
         "skills": ["chat", "reasoning"],
     },
 }
+
+
+# ==================== JSON-RPC 客户端封装 ====================
+
+class A2AClient:
+    """A2A Client 的最小封装：把 JSON-RPC 请求 POST 到子 Agent 的单个端点"""
+
+    def __init__(self, base_url: str, client: httpx.AsyncClient):
+        self.base_url = base_url.rstrip("/") + "/"
+        self.client = client
+
+    async def call(self, method: str, params: dict, rpc_id: str = "1") -> dict:
+        """发送一个 JSON-RPC 2.0 请求并返回 result"""
+        payload = {"jsonrpc": "2.0", "id": rpc_id, "method": method, "params": params}
+        resp = await self.client.post(self.base_url, json=payload)
+        resp.raise_for_status()
+        body = resp.json()
+        if "error" in body:
+            raise RuntimeError(f"JSON-RPC 错误: {body['error']}")
+        return body["result"]
+
+    async def send_task(self, params: dict) -> dict:
+        """tasks/send —— 提交任务"""
+        return await self.call("tasks/send", params)
+
+    async def get_task(self, task_id: str) -> dict:
+        """tasks/get —— 查询任务状态"""
+        return await self.call("tasks/get", {"id": task_id})
 
 
 # ==================== 节点 ====================
@@ -522,7 +670,7 @@ AGENT_REGISTRY = {
 async def node_decompose(state: OrchestratorState) -> dict:
     """
     节点①：任务分解。
-    
+
     主管 LLM 分析用户请求，拆分为子任务，并决定每个子任务分配给哪个 Agent。
     """
     decompose_llm = llm.with_structured_output(SubtaskList)
@@ -551,7 +699,7 @@ async def node_decompose(state: OrchestratorState) -> dict:
 生成子任务列表，每个子任务包含 title、description、skill、agent 字段。"""
 
     result = await decompose_llm.ainvoke(prompt)
-    
+
     # 为每个子任务生成唯一 ID
     subtasks = []
     for i, st in enumerate(result.subtasks):
@@ -569,9 +717,11 @@ async def node_decompose(state: OrchestratorState) -> dict:
 
 async def node_dispatch_and_wait(state: OrchestratorState) -> dict:
     """
-    节点②：分发任务给各子 Agent 并等待结果。
-    
-    互不依赖的子任务并行执行，有依赖的串行执行。
+    节点②：以 Client 身份把任务发给各子 Agent（远端 Agent）并等待结果。
+
+    主管是 Client、子 Agent 是远端 Agent：
+    通过 Agent Card 里的 url（单个 JSON-RPC 端点）调用 tasks/send 提交，
+    然后轮询 tasks/get 直到终态。
     """
     subtasks = state["subtasks"]
     results = []
@@ -583,37 +733,33 @@ async def node_dispatch_and_wait(state: OrchestratorState) -> dict:
             if not agent_info:
                 return {**st, "status": "failed", "error": f"未知 Agent: {st['agent']}"}
 
+            rpc = A2AClient(agent_info["url"], client)
             try:
-                resp = await client.post(
-                    f"{agent_info['url']}/tasks",
-                    json={
-                        "id": st["id"],
-                        "session_id": state["session_id"],
+                # 1) 提交任务：tasks/send（JSON-RPC，不是 POST /tasks）
+                await rpc.send_task({
+                    "id": st["id"],
+                    "sessionId": state["session_id"],
+                    "skill_id": st.get("skill", ""),
+                    "metadata": {
+                        "user_query": state["user_query"],
                         "title": st["title"],
                         "description": st["description"],
-                        "context": {"user_query": state["user_query"]},
-                        "skill_id": st.get("skill", ""),
                     },
-                )
-                resp.raise_for_status()
-                task_info = resp.json()
+                })
 
-                # 轮询等待任务完成
+                # 2) 轮询任务状态：tasks/get
                 for _ in range(60):  # 最多等 60 秒
                     await asyncio.sleep(1)
-                    status_resp = await client.get(
-                        f"{agent_info['url']}/tasks/{st['id']}"
-                    )
-                    status_info = status_resp.json()
-                    
-                    if status_info["status"] in ("completed", "failed", "cancelled"):
+                    task = await rpc.get_task(st["id"])
+                    state_value = task["status"]["state"]   # status.state 是对象字段
+                    if state_value in ("completed", "failed", "canceled"):
                         return {
                             "task_id": st["id"],
                             "title": st["title"],
                             "agent": st["agent"],
-                            "status": status_info["status"],
-                            "result": status_info.get("artifact"),
-                            "error": status_info.get("error"),
+                            "status": state_value,
+                            "result": task.get("artifact"),
+                            "error": task["status"].get("message"),
                         }
 
                 return {**st, "status": "failed", "error": "任务超时"}
@@ -630,7 +776,7 @@ async def node_dispatch_and_wait(state: OrchestratorState) -> dict:
 async def node_assemble(state: OrchestratorState) -> dict:
     """节点③：汇总所有子任务结果，生成最终回复"""
     results = state["task_results"]
-    
+
     # 分离成功和失败的结果
     success_results = [r for r in results if r["status"] == "completed"]
     failed_results = [r for r in results if r["status"] != "completed"]
@@ -685,48 +831,79 @@ orchestrator = build_orchestrator()
 
 ### 2.4.4 流式推送：A2A 的 Task Status Update 事件
 
-A2A 支持 SSE 流式推送任务状态更新。子 Agent 在执行过程中可以持续推送中间结果：
+A2A 的流式推送走 JSON-RPC 方法 **`tasks/stream`**（消息流是 `message/stream`），服务端返回 SSE（`text/event-stream`）。与 2.3.1 表格一致，每个 `data` 都是一个 JSON-RPC 2.0 响应对象，`result` 里携带 `TaskStatusUpdateEvent` 或 `TaskArtifactUpdateEvent`。子 Agent 在执行过程中可以持续推送中间结果：
 
 ```python
-# agents/data_agent/main.py —— 流式任务状态端点
+# agents/data_agent/main.py —— 给 2.4.2 的 JSON-RPC 端点增加流式方法 tasks/stream
 
-def _sse(event_type: str, data: dict) -> str:
-    """将 type 和 data 格式化为标准 SSE 事件字符串"""
-    payload = {"type": event_type, **data}
+import json
+from fastapi.responses import StreamingResponse
+
+
+def _sse(rpc_id: str, result: dict) -> str:
+    """
+    把 JSON-RPC 2.0 响应对象格式化为 SSE 事件。
+
+    注意：A2A 的流式推送里，每个 data 都是一个完整的 JSON-RPC 2.0 响应，
+    result 携带 TaskStatusUpdateEvent 或 TaskArtifactUpdateEvent，
+    绝不是 {"type":"status_update", ...} 这样的扁平 JSON。
+    """
+    payload = {"jsonrpc": "2.0", "id": rpc_id, "result": result}
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
-@app.get("/tasks/{task_id}/stream")
-async def stream_task(task_id: str):
-    """A2A 任务状态流——SSE 端点"""
-    async def event_stream():
-        task = tasks.get(task_id)
-        if not task:
-            yield _sse("error", {"message": "task not found"})
-            return
+async def _stream_task_events(rpc_id: str, params: dict):
+    """
+    tasks/stream —— 任务状态流（A2A 的 SSE 推送）。
 
-        last_status = None
-        
-        while task["status"] not in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED):
-            if task["status"] != last_status:
-                last_status = task["status"]
-                yield _sse("status_update", {"task_id": task_id, "status": last_status})
-            
-            # 如果有中间产出，推送
-            if task.get("intermediate_artifact"):
-                yield _sse("artifact_update", {"task_id": task_id, "artifact": task['intermediate_artifact']})
-                del task["intermediate_artifact"]
-            
-            await asyncio.sleep(0.5)
+    事件定义（与 2.3.1 表格一致）：
+    - TaskStatusUpdateEvent:   {id, status: {state, ...}, final}
+    - TaskArtifactUpdateEvent: {id, artifact: {parts: [...]}, final}
+    其中 status 是对象，status.state 才是状态字符串；
+    final 标志该事件是否为终态（completed / failed / canceled）。
+    """
+    task_id = params.get("id")
+    task = tasks.get(task_id)
+    if not task:
+        yield _sse(rpc_id, {"id": task_id, "status": {"state": "failed", "message": "任务不存在"}, "final": True})
+        return
 
-        # 最终状态
-        yield _sse("final", {"task_id": task_id, "status": task['status']})
-        yield "data: [DONE]\n\n"
+    last_state = None
 
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
+    # 非终态循环推送中间状态
+    while task["status"]["state"] not in ("completed", "failed", "canceled"):
+        state = task["status"]["state"]
+        if state != last_state:
+            last_state = state
+            # TaskStatusUpdateEvent：id + status 对象 + final 标志
+            yield _sse(rpc_id, {"id": task_id, "status": task["status"], "final": False})
+
+        # 中间产出 → TaskArtifactUpdateEvent
+        if task.get("intermediate_artifact"):
+            yield _sse(rpc_id, {"id": task_id, "artifact": task["intermediate_artifact"], "final": False})
+            del task["intermediate_artifact"]
+
+        await asyncio.sleep(0.5)
+
+    # 终态事件：final=true（带最终状态和产出物）
+    yield _sse(rpc_id, {
+        "id": task_id,
+        "status": task["status"],
+        "artifact": task.get("artifact"),
+        "final": True,
+    })
+    yield "data: [DONE]\n\n"
+
+
+# 在 2.4.2 的 json_rpc_endpoint 分发器里加一行（方法名还是同一个端点）：
+#   if req.method in ("tasks/stream", "message/stream"):
+#       return StreamingResponse(
+#           _stream_task_events(req.id, req.params),
+#           media_type="text/event-stream",
+#       )
 ```
 
-主管 Agent 可以用流式端点实时获取子任务进度，并向用户推送进度信息：
+主管 Agent 可以用 `tasks/stream` 实时订阅子任务进度，并向用户推送进度信息：
 
 ```
 用户看到：
@@ -982,7 +1159,7 @@ async def generate_report(request: ReportRequest):
 |------|---------|--------|
 | 多 Agent 模式 | Supervisor / Peer-to-Peer / Hierarchical | 本项目用 Supervisor：一个主管分配任务，子 Agent 各司其职 |
 | A2A Agent Card | `/.well-known/agent.json` 暴露能力描述 | 每个 Agent 自描述"我能干什么、输入输出格式是什么" |
-| A2A Task 生命周期 | submitted → working → completed/failed/cancelled | 一切工作以 Task 为单位，有 ID、有状态、可追踪、可取消 |
+| A2A Task 生命周期 | submitted → working → … → completed/failed/canceled（含 input-required 索取澄清） | 一切工作以 Task 为单位，有 ID、有状态机、可追踪、可取消 |
 | 任务分发与汇总 | 主管 LLM 拆分 → 子 Agent 并行执行 → 主管汇总 | 互不依赖的并行（`asyncio.gather`），有依赖的串行 |
 | 超时与降级 | `asyncio.wait_for` 超时兜底 + 降级结果标注 | 子 Agent 挂了不能拖垮主管，诚实告知用户"部分结果缺失" |
 | 动态发现 vs 静态注册 | 本项目用静态注册表，生产环境可升级为动态发现 | 3~5 个 Agent 不需要动态发现，配置文件足够 |

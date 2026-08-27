@@ -90,9 +90,10 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 splitter = RecursiveCharacterTextSplitter(
     separators=["\n\n", "\n", "。", ".", " ", ""],  # 优先级从高到低
-    chunk_size=500,         # 目标大小（token 数）
-    chunk_overlap=80,       # 相邻块重叠 80 token
-    length_function=len,    # 生产环境用 tiktoken 计数
+    chunk_size=500,         # 目标大小（这里 length_function=len，按字符数计）
+    chunk_overlap=80,       # 相邻块重叠 80 字符
+    length_function=len,    # 按字符数计数；如需按 token 精确切分：
+                            # length_function=lambda t: len(tiktoken.get_encoding("o200k_base").encode(t))
 )
 
 chunks = splitter.split_text(document)
@@ -168,9 +169,13 @@ async def two_stage_retrieval(query: str, top_k: int = 5):
     doc_ids = [d["doc_id"] for d in relevant_docs]
 
     # 阶段二：在命中文档内做块级精排
+    if not doc_ids:
+        return []  # 空列表时 Milvus 的 in 表达式非法，直接返回空结果
+    # Milvus 过滤表达式要求字符串字面量用双引号：doc_id in ["a", "b"]
+    id_expr = "doc_id in [" + ", ".join(f'"{d}"' for d in doc_ids) + "]"
     chunks = await search_collection(
         "doc_chunks", query, top_k=top_k,
-        filter_expr=f'doc_id in {doc_ids}',
+        filter_expr=id_expr,
     )
     return chunks
 ```
@@ -224,14 +229,15 @@ embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
 
 for doc in chunks:
     dense_vector = await embeddings.aembed_query(doc.page_content)
-    sparse_vector = bm25_ef.encode_queries([doc.page_content])[0]
+    # 文档入库侧用 encode_documents（encode_queries 只用于查询侧）
+    sparse_vector = bm25_ef.encode_documents([doc.page_content])[0]
 
+    # doc_id 等字段由 doc.metadata 统一提供，避免显式键与 **doc.metadata 重复
     collection.insert([{
+        **doc.metadata,
         "content": doc.page_content,
         "dense_vector": dense_vector,
         "sparse_vector": sparse_vector,  # 稀疏向量存入 Milvus
-        "doc_id": doc.metadata["doc_id"],
-        **doc.metadata,
     }])
 
 
@@ -255,7 +261,8 @@ async def hybrid_search(query: str, top_k: int = 10) -> list[dict]:
     sparse_req = AnnSearchRequest(
         data=[sparse_query],
         anns_field="sparse_vector",
-        param={"metric_type": "IP", "params": {"nprobe": 16}},
+        # 稀疏索引不使用 nprobe（那是稠密 IVF 索引的参数）；稀疏检索一般配置 drop_ratio_search
+        param={"metric_type": "IP", "params": {"drop_ratio_search": 0.2}},
         limit=top_k * 2,
     )
 
@@ -305,8 +312,8 @@ base_retriever = HybridRetriever(...)
 
 # 加 Reranker 做精排
 compressor = CohereRerank(
-    model="rerank-v3",     # Cohere 的 rerank 模型
-    top_n=5,               # 从 10 个候选中保留前 5
+    model="rerank-multilingual-v3.0",  # Cohere 的跨语言 rerank 模型
+    top_n=5,                           # 从 10 个候选中保留前 5
 )
 retriever = ContextualCompressionRetriever(
     base_compressor=compressor,
@@ -387,10 +394,10 @@ async def rewrite_with_history(history: list[dict], query: str) -> str:
     )
 
     rewritten = await call_llm_with_retry(
-        messages=REWRITE_WITH_HISTORY_PROMPT.format(
+        messages=REWRITE_WITH_HISTORY_PROMPT.format_messages(
             history=history_text,
             query=query,
-        ).to_messages(),
+        ),
         model="gpt-4o-mini",
     )
     return rewritten.strip()
@@ -413,9 +420,9 @@ DECOMPOSE_PROMPT = ChatPromptTemplate.from_messages([
 ## 示例：
 用户：蓝牙耳机和有线耳机哪个音质好？
 分解：
-1. 蓝牙耳机音质评测
-2. 有线耳机音质评测
-3. 蓝牙耳机与有线耳机音质对比
+蓝牙耳机音质评测
+有线耳机音质评测
+蓝牙耳机与有线耳机音质对比
 
 输出格式：每行一个子查询，不要编号。"""),
     ("user", "{query}"),
@@ -425,10 +432,29 @@ DECOMPOSE_PROMPT = ChatPromptTemplate.from_messages([
 async def decompose_query(query: str) -> list[str]:
     """将复杂问题分解为多个子查询，各自检索后合并结果"""
     response = await call_llm_with_retry(
-        messages=DECOMPOSE_PROMPT.format(query=query).to_messages(),
+        messages=DECOMPOSE_PROMPT.format_messages(query=query),
         model="gpt-4o-mini",
     )
     return [line.strip("- ").strip() for line in response.split("\n") if line.strip()]
+
+
+async def rerank(query: str, docs: list[dict], final_top_k: int = 5) -> list[dict]:
+    """
+    对检索候选做 Reranker 精排（见 5.3.4 节）。
+
+    docs: list[dict]，每项含 content/title 等字段。
+    内部用 CohereRerank 对 (query, 候选) 做交叉编码打分，只保留前 final_top_k 条。
+    """
+    from langchain_cohere import CohereRerank
+    from langchain_core.documents import Document
+
+    compressor = CohereRerank(model="rerank-multilingual-v3.0", top_n=final_top_k)
+    compressed = await compressor.acompress_documents(
+        query=query,
+        documents=[Document(page_content=d["content"], metadata={"title": d.get("title", "")}) for d in docs],
+    )
+    kept = {c.page_content for c in compressed}
+    return [d for d in docs if d["content"] in kept]
 ```
 
 检索时每个子查询独立搜索，最后合并去重：
@@ -483,7 +509,7 @@ async def hyde_retrieval(query: str, top_k: int = 5) -> list[Document]:
     """HyDE 检索：生成假设答案 → 用假设答案做向量检索"""
     # 1. 生成假设文档
     hypothetical_doc = await call_llm_with_retry(
-        messages=HYDE_PROMPT.format(query=query).to_messages(),
+        messages=HYDE_PROMPT.format_messages(query=query),
         model="gpt-4o-mini",
     )
 
@@ -518,7 +544,7 @@ HyDE 特别适合以下场景：
 # services/rag_service.py
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from core.llm import call_llm_with_retry
-from core.query_rewriter import rewrite_with_history, decompose_query, hyde_retrieval
+from core.query_rewriter import rewrite_with_history, decompose_query, hyde_retrieval, rerank
 from core.hybrid_search import hybrid_search
 from core.logger import get_logger
 
@@ -538,7 +564,9 @@ async def rag_query(
     """
 
     # ====== 第零步：判断是否需要特殊处理 ======
-    use_decompose = any(kw in query for kw in ["和", "相比", "区别", "对比", "vs"])
+    # 注意：不能把"和"这类超高频单字当作分解触发词，否则几乎每次都会误触发；
+    # 改用更精确的多字短语模式，复杂场景交给 LLM 判断
+    use_decompose = any(p in query for p in ["相比", "对比", "区别", "差异", "哪个好", "如何选择", "哪个更"])
     use_hyde = len(query) <= 6
 
     # ====== 第一步：查询改写 ======
@@ -750,7 +778,7 @@ RAG 解决的问题：
 | 检索结果全是同一篇文档 | 某篇长文档被切成 100 块，占了检索结果 | 检索后没有做文档级去重 | `retrieved_docs` 按 `doc_id` 去重，每篇文档最多保留 3 块 |
 | 回答引用了过时文档 | 政策改了，用户看到的还是旧的 | Milvus 中旧文档没删 | 文档入库时存 `updated_at`，检索加过滤 `updated_at > 某个日期` |
 | 用户问"那个"搜不到 | 口语化的指代词没有语义 | 没做历史补全改写 | 检索前先做 query 改写（5.4 节） |
-| 中英混合术语匹配差 | "大模型" vs "LLM"——向量认为不相似 | 单一语言模型对跨语言映射弱 | 用多语言 embedding（text-embedding-3-large）或在 query 改写时统一术语 |
+| 中英混合术语匹配差 | "大模型" vs "LLM"——向量认为不相似 | query 与文档术语不一致，向量无法命中另一种表述 | 从 query 改写/术语统一入手（见 5.4 节）；text-embedding-3 系列本身支持多语言，无需换 embedding 模型 |
 | 检索延迟太高 | 混合检索 + Reranker 耗时 2 秒 | Reranker 对每个候选做推理，候选太多 | 控制 Reranker 候选 ≤20，或用 BGE-Reranker 本地部署避免网络延迟 |
 | 文档切块后上下文断裂 | chunk 1 说"根据上文的规定"，chunk 0 不在检索结果里 | chunk 间失去关联 | `chunk_overlap` 设 10~20%，或在检索时把命中的 chunk 的前后 chunk 也带回来（parent document retrieval） |
 

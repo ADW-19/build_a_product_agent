@@ -144,11 +144,11 @@ docs/
 
 | 组件               | 选型       | 版本要求 |
 | ------------------ | ---------- | -------- |
-| 语言               | Python     | 3.11+    |
-| Web 框架           | FastAPI    | ≥ 0.115 |
-| Agent 编排         | LangGraph  | ≥ 0.3   |
-| LLM 工具层         | LangChain  | ≥ 1.0   |
-| 数据校验           | Pydantic   | v2       |
+| 语言               | Python     | 3.13+    |
+| Web 框架           | FastAPI    | ≥ 0.136 |
+| Agent 编排         | LangGraph  | ≥ 1.2   |
+| LLM 工具层         | LangChain  | ≥ 1.3   |
+| 数据校验           | Pydantic   | ≥ 2.13  |
 | 业务数据库         | PostgreSQL | -        |
 | 缓存/会话/限流     | Redis      | -        |
 | 向量库（长期记忆） | Milvus     | -        |

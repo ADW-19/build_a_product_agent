@@ -44,7 +44,7 @@ docs/
 2. **正文**：小节标题 `## 1.1 小节标题`、`## 1.2`…（章内小节号从 1.1 递增）。
 3. **叙事结构**：每个主题按 `问题场景（学生/课堂典型错误代码）→ 本质原因 → 正确做法（带完整可运行代码）→ 对比表格 → 一句话总结` 展开。先给错误示范再给正确做法是强约定。
 4. **表达手段**：大量使用对比表格（错误做法 vs 正确做法、维度对比）、ASCII 示意图（时序/架构图）、错误代码 vs 正确代码并置。每条关键结论通常以 `**一句话…：**` 加粗短句收束。
-5. **示例代码**：均为 Python 3.11+。Web 层用 FastAPI（async def 路由），Agent 编排用 LangGraph（`StateGraph`/`astream_events`/checkpointer），工具层用 LangChain（`@tool`），数据校验用 Pydantic v2，Redis 一律用 `redis.asyncio`，LLM 客户端用 `AsyncOpenAI`。关键 SDK 版本要求：FastAPI ≥ 0.115、LangGraph ≥ 0.3、LangChain ≥ 1.0、Pydantic v2。
+5. **示例代码**：均为 Python 3.13+。Web 层用 FastAPI（async def 路由），Agent 编排用 LangGraph（`StateGraph`/`astream_events`/checkpointer），工具层用 LangChain（`@tool`），数据校验用 Pydantic v2，Redis 一律用 `redis.asyncio`，LLM 客户端用 `AsyncOpenAI`。关键 SDK 版本要求：FastAPI ≥ 0.136、LangGraph ≥ 1.2、LangChain ≥ 1.3、Pydantic ≥ 2.13。
 6. **收尾**：章末通常有 `常见踩坑清单`（表格：坑/现象/原因/解法）和 `本章小结`（表格：要点/核心原则/一句话记住）。新文章建议沿用。
 7. **全章示例代码假设统一的项目骨架**：`core/`（config、llm、cache、database、agent、logger、middleware 单例封装）+ `routes/` + `services/` + `models/` + `tools/` + `main.py`。各章代码示例互相引用这个结构（如 `from core.llm import call_llm_with_retry`），写新文章时保持该骨架一致，不要引入与已有章节冲突的目录约定。
 

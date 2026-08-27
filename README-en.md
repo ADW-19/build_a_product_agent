@@ -144,11 +144,11 @@ docs/
 
 | Component                    | Selection  | Version Requirement |
 | ---------------------------- | ---------- | ------------------- |
-| Language                     | Python     | 3.11+               |
-| Web Framework                | FastAPI    | ≥ 0.115            |
-| Agent Orchestration          | LangGraph  | ≥ 0.3              |
-| LLM Tool Layer               | LangChain  | ≥ 1.0              |
-| Data Validation              | Pydantic   | v2                  |
+| Language                     | Python     | 3.13+               |
+| Web Framework                | FastAPI    | ≥ 0.136            |
+| Agent Orchestration          | LangGraph  | ≥ 1.2              |
+| LLM Tool Layer               | LangChain  | ≥ 1.3              |
+| Data Validation              | Pydantic   | ≥ 2.13             |
 | Business Database            | PostgreSQL | -                   |
 | Cache/Session/Rate Limit     | Redis      | -                   |
 | Vector DB (Long-term Memory) | Milvus     | -                   |
