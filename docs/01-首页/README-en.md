@@ -22,6 +22,11 @@
 
 ---
 
+> [!IMPORTANT]
+> **Version Note**: This documentation is based on the author's hands-on development experience and will be updated from time to time. As the author's native language is Chinese, it primarily serves technical professionals in Mainland China, Hong Kong, Macau, Taiwan, Singapore, and other regions. A full English edition may be considered in the future if there is significant international interest.
+
+---
+
 ## Project Overview
 
 This is a **documentation-only project** focused on the core knowledge points of AI Agent backend development. Each chapter is a self-contained technical article covering:
@@ -41,9 +46,6 @@ This is a **documentation-only project** focused on the core knowledge points of
 | 🧪 **Testing & Ops Included** | Covers not just "how to build", but also "how to test" and "how to operate" |
 
 > 🎯 **Target audience**: Developers with basic programming skills. The entire book follows the narrative **"Industry Standards → Why Schools Don't Teach This → How You Should Code"**.
-
-> [!IMPORTANT]
-> **Version Note**: This documentation is based on the author's hands-on development experience and will be updated from time to time. As the author's native language is Chinese, it primarily serves technical professionals in Mainland China, Hong Kong, Macau, Taiwan, Singapore, and other regions. A full English edition may be considered in the future if there is significant international interest.
 
 ---
 
