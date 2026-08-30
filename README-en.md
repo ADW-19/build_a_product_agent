@@ -230,7 +230,7 @@ docs/
 
 | | |
 |:---:|:---|
-| ✍️ **Author** | Andy Yanqi Wang (ADW-19) · Shanghai, China |
+| ✍️ **Author** | ADW-19 · Shanghai, China |
 | 📕 **RedNote (Xiaohongshu)** | ID: `ADW_AI` |
 
 Feel free to open an issue for suggestions or corrections, or submit a PR directly.
