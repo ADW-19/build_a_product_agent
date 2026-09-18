@@ -78,13 +78,7 @@ cd build_a_product_agent
 # 4. 第4章：Agent通路（单Agent与多Agent协作）
 # 5. 第5章：系统测试（上线前的测试体系）
 # 6. 第6章：AI Infra 基座（模型部署与选型）
-
-# 文档自检（校验全文示例代码块：语法 / YAML / 语言标注 / 已弃用 API）
-pip install pyyaml
-python scripts/check_snippets.py
 ```
-
-> 手册的硬约定是"示例代码能跑"，所以仓库带一个静态校验闸门：`scripts/check_snippets.py` 会把所有代码块抽出来，检查 Python 语法、YAML 可解析性、围栏语言标注，并扫描已弃用 API（`set_entry_point`、`create_react_agent`、`from langchain.retrievers`、把 `RedisSaver.from_conn_string` 当实例用……）。它只报能明确定性的问题，不报"建议类"告警。提交前请保证 0 个问题。
 
 ---
 

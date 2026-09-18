@@ -80,13 +80,7 @@ cd build_a_product_agent
 # 4. Chapter 4: Agent Pathways (single & multi-agent collaboration)
 # 5. Chapter 5: System Testing (pre-deployment testing framework)
 # 6. Chapter 6: AI Infra Foundation (model deployment & selection)
-
-# Documentation self-check (validates every code block: syntax / YAML / language tags / deprecated APIs)
-pip install pyyaml
-python scripts/check_snippets.py
 ```
-
-> The manual's hard rule is "examples must run", so the repo ships a static gate: `scripts/check_snippets.py` extracts every fenced code block and checks Python syntax, YAML parseability, and fence language tags, and scans for deprecated API usage (`set_entry_point`, `create_react_agent`, `from langchain.retrievers`, passing `RedisSaver.from_conn_string` where an instance is expected, …). It only reports what is unambiguously wrong — no advisory warnings. Keep it at zero problems before committing.
 
 ---
 
