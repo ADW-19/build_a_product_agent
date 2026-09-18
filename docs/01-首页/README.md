@@ -8,6 +8,10 @@
 
 <br/>
 
+**✍️ 作者：[ADW-19](https://github.com/ADW-19) · 中国上海浦东新区，陆家嘴 · 小红书：`ADW_AI`**
+
+<br/>
+
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 [![GitHub Stars](https://img.shields.io/github/stars/ADW-19/build_a_product_agent?style=flat&logo=github&color=yellow)](https://github.com/ADW-19/build_a_product_agent/stargazers)
 [![Last Commit](https://img.shields.io/github/last-commit/ADW-19/build_a_product_agent?logo=git&color=orange)](https://github.com/ADW-19/build_a_product_agent/commits/main)
@@ -240,7 +244,7 @@ docs/
 
 | | |
 |:---:|:---|
-| ✍️ **作者** | ADW-19 · 中国上海 |
+| ✍️ **作者** | ADW-19 · 中国上海浦东新区，陆家嘴 |
 | 📕 **小红书** | ID：`ADW_AI` |
 
 欢迎通过 Issue 提出建议、勘误，或直接提交 PR。

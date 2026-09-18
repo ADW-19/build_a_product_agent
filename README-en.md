@@ -8,6 +8,10 @@
 
 <br/>
 
+**✍️ Author: [ADW-19](https://github.com/ADW-19) · Lujiazui, Pudong New Area, Shanghai, China · RedNote: `ADW_AI`**
+
+<br/>
+
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 [![GitHub Stars](https://img.shields.io/github/stars/ADW-19/build_a_product_agent?style=flat&logo=github&color=yellow)](https://github.com/ADW-19/build_a_product_agent/stargazers)
 [![Last Commit](https://img.shields.io/github/last-commit/ADW-19/build_a_product_agent?logo=git&color=orange)](https://github.com/ADW-19/build_a_product_agent/commits/main)
@@ -232,7 +236,7 @@ build_a_product_agent/
 
 | | |
 |:---:|:---|
-| ✍️ **Author** | ADW-19 · Shanghai, China |
+| ✍️ **Author** | ADW-19 · Lujiazui, Pudong New Area, Shanghai, China |
 | 📕 **RedNote (Xiaohongshu)** | ID: `ADW_AI` |
 
 Feel free to open an issue for suggestions or corrections, or submit a PR directly.
