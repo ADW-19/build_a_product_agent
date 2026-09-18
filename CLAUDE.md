@@ -8,7 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 唯一的"可执行部分"是 `scripts/check_snippets.py`（文档代码块静态校验闸门），它校验的是文档里的代码块，不是项目源码。因此本项目的"开发任务"几乎都是**写/改 Markdown 文章**，而非写代码。代码块只是文章内容的一部分（示例代码）。
 
-- 作者：Andy Yanqi Wang (ADW-19)，中国上海浦东新区，陆家嘴
+- 作者：Andy Yanqi Wang (ADW-19)，中国，上海市，浦东新区，陆家嘴
 - 许可：MIT
 - 提交信息使用中文（如 `增加AI Infra章节`）
 - 英文版：根目录和 `docs/01-首页/` 下有 `README-en.md` 落地页；正文英文版暂未发布（TBD）。新增正文无需同步英文。
