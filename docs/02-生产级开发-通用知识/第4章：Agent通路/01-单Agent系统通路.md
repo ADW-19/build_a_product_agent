@@ -21,11 +21,11 @@
 │  └──────────┘                                       │
 ├─────────────────────────────────────────────────────┤
 │  问题二：关于这个用户，我知道什么？                      │
-│  ┌──────────┐  ┌────────────┐                       │
-│  │ 短期记忆  │  │ 长期记忆    │                       │
-│  │ 刚才聊了啥 │  │ 用户是谁    │                       │
-│  │ (Redis)  │  │ (Milvus)   │                       │
-│  └──────────┘  └────────────┘                       │
+│  ┌────────────────┐  ┌────────────┐                 │
+│  │ 会话历史        │  │ 长期记忆    │                 │
+│  │ 刚才聊了啥      │  │ 用户是谁    │                 │
+│  │ (checkpointer) │  │ (Milvus)   │                 │
+│  └────────────────┘  └────────────┘                 │
 ├─────────────────────────────────────────────────────┤
 │  问题三：需要什么外部知识？                             │
 │  ┌──────────┐                                       │
@@ -54,14 +54,14 @@
 # core/single_agent.py
 from typing import TypedDict, Annotated, Literal
 from operator import add
-from langgraph.graph import StateGraph, END
+from langgraph.graph import StateGraph, START, END
+from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
-from langgraph.checkpoint.redis import RedisSaver
 from langchain_openai import ChatOpenAI
-from langchain_core.messages import BaseMessage
+from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
+from langchain_core.tools import ToolException
 
 from core.intent_classifier import classify_intent, Intent
-from core.session import get_history, append_message_with_limit
 from core.long_memory_store import search_similar_memories
 from core.rag_service import hybrid_search, rerank
 from core.tool_guard import tool_guard
@@ -75,21 +75,31 @@ class AgentState(TypedDict):
     session_id: str
     user_id: str
 
-    # 对话消息（Annotated + add 实现追加）
-    messages: Annotated[list[BaseMessage], add]
+    # 会话消息：**唯一真相**，由 checkpointer 按 thread_id=session_id 持久化。
+    # 用 add_messages 而不是自定义 add：它按消息 id 去重/更新，并保证
+    # assistant(tool_calls) 与对应 tool 结果的配对关系不被破坏。
+    messages: Annotated[list[BaseMessage], add_messages]
+
+    # 本轮组装出来的 system prompt（system 指令 + 长期记忆 + RAG + 工具提示）。
+    # 注意它**不进入 messages 通道**——原因见 1.1.4。
+    system_prompt: str
 
     # 各子系统注入的上下文
     intent: str                          # 意图分类结果
-    short_term_context: list[dict]       # 短期记忆（最近对话）
     long_term_context: list[dict]        # 长期记忆（用户画像）
     rag_context: list[dict]              # RAG 检索结果
 
     # 工具调用控制
     available_tools: list[str]           # 当前节点可用的工具名列表
+    write_authorized: bool               # 本会话是否已授权过写操作（1.3.3 用）
 
     # 内部动态标记（下划线开头，节点之间传递的中间判断）
     # 显式声明，避免类型检查报"未声明的字段"错误
     _need_rag: bool                      # 是否需要 RAG 检索（由 node_classify_intent 写入）
+
+    # 人工审批结果。必须显式声明：aupdate_state 只能更新 State 里已声明的字段，
+    # 往未声明的键注入数据会被忽略——1.3.2 的"确认→恢复"就靠这个字段
+    human_approved: bool
 
     # 最终输出
     final_response: str
@@ -97,7 +107,7 @@ class AgentState(TypedDict):
 
 # ==================== 节点实现 ====================
 
-llm = ChatOpenAI(model="gpt-4o")
+llm = ChatOpenAI(model="gpt-5.1")
 
 
 async def node_classify_intent(state: AgentState) -> dict:
@@ -111,7 +121,9 @@ async def node_classify_intent(state: AgentState) -> dict:
     # 根据意图决定需要启用哪些能力
     need_tools = (intent_result.intent == Intent.ACTION)
     need_rag = (intent_result.intent == Intent.QUESTION)
-    # 长期记忆总是检索（成本很低，≈50ms）
+    # 长期记忆总是检索。注意它并不"便宜"：检索前要先对 query 做一次 embedding，
+    # 那是一次外部 API 往返（量级 100~300ms），不是几十毫秒的本地查询。
+    # 对延迟敏感的场景，应把它做成"与意图分类并行"而不是串在后面。
 
     return {
         "intent": intent_result.intent,
@@ -122,28 +134,20 @@ async def node_classify_intent(state: AgentState) -> dict:
 
 async def node_load_memories(state: AgentState) -> dict:
     """
-    节点②：加载记忆（短 + 长）
-    
-    短期记忆从 Redis 读会话历史。
-    长期记忆从 Milvus 检索用户画像。
-    两者并行，互不依赖。
-    """
-    import asyncio
+    节点②：加载长期记忆
 
-    # 并行加载短期和长期记忆
-    short_term, long_term = await asyncio.gather(
-        get_history(state["session_id"]),
-        search_similar_memories(
-            user_id=state["user_id"],
-            query_text=state["user_query"],
-            top_k=5,
-        ),
+    短期记忆（会话历史）已经由 checkpointer 随 messages 一起持久化，
+    这里**不再**从 Redis 另取一份——同一份历史存在两处（checkpointer 与
+    自维护的 Redis 消息列表），必然对不上：两边裁剪规则不同、写入时机不同，
+    最终表现为"模型看到的上下文和界面显示的不一致"。
+    """
+    long_term = await search_similar_memories(
+        user_id=state["user_id"],
+        query_text=state["user_query"],
+        top_k=5,
     )
 
-    return {
-        "short_term_context": short_term,
-        "long_term_context": long_term,
-    }
+    return {"long_term_context": long_term}
 
 
 async def node_search_rag(state: AgentState) -> dict:
@@ -164,62 +168,60 @@ async def node_search_rag(state: AgentState) -> dict:
 
 async def node_assemble_context(state: AgentState) -> dict:
     """
-    节点④：上下文组装
-    
-    将系统提示、记忆、RAG 结果拼接为 messages，
-    作为 LLM 推理节点的输入。
-    """
-    messages = []
+    节点④：组装本轮上下文
 
-    # 1. 系统提示词
+    只产出两样东西：
+    - system_prompt：system 指令 + 长期记忆 + RAG 结果 + 可用工具提示
+    - 本轮的用户消息（追加进 messages 通道，由 add_messages 维护）
+
+     ❌ 不要在这里把"system + 全部历史 + 本轮提问"整体 return 给 messages。
+     messages 是**追加语义**的通道，整段重建等于每轮都往历史里再插一份完整历史：
+     system prompt 与旧对话从第 2 轮起成倍复制，checkpoint 体积持续膨胀，
+     token 成本随之上涨——而回复内容看起来仍然正常，所以极难发现。
+     原因与两个正确的写法见 1.1.4。
+    """
     system_parts = ["你是用户的智能助手，回答准确、简洁。\n"]
-    
-    # 2. 长期记忆（用户画像）
+
+    # 1. 长期记忆（用户画像）
     if state["long_term_context"]:
         facts = "\n".join(f"- {m['content']}" for m in state["long_term_context"])
         system_parts.append(f"## 关于此用户的已知信息\n{facts}\n")
-    
-    # 3. RAG 结果
+
+    # 2. RAG 结果
     if state.get("rag_context"):
         docs = "\n\n".join(
             f"[{d['title']}]\n{d['content']}" for d in state["rag_context"]
         )
         system_parts.append(f"## 参考资料\n{docs}\n")
-    
-    # 4. 可用工具
+
+    # 3. 可用工具
     if state["available_tools"]:
         tools_hint = "你可以调用以下工具来完成任务：" + ", ".join(state["available_tools"])
         system_parts.append(tools_hint)
 
-    messages.append({"role": "system", "content": "\n".join(system_parts)})
-
-    # 5. 短期记忆（会话历史）
-    for msg in state["short_term_context"]:
-        messages.append(msg)
-
-    # 6. 当前用户消息
-    messages.append({"role": "user", "content": state["user_query"]})
-
-    return {"messages": messages}
+    return {
+        "system_prompt": "\n".join(system_parts),
+        "messages": [HumanMessage(content=state["user_query"])],
+    }
 
 
 async def node_llm_reason(state: AgentState) -> dict:
     """
     节点⑤：LLM 推理
-    
-    核心推理节点。LLM 根据完整的上下文决定：
-    - 回复文本（不需要工具时）
-    - 调用工具（需要操作时）
-    
-    如果绑定了工具，LLM 可能返回 tool_calls。
+
+    输入 = 本轮组装好的 system prompt + 持久化的 messages。
+    messages 是唯一真相（含历史与已经发生的 tool 往返），所以历史只会有一份，
+    ReAct 循环第二轮起也能自动看到上一轮的工具结果。
     """
+    prompt = [SystemMessage(content=state["system_prompt"]), *state["messages"]]
+
     if state["available_tools"]:
         llm_with_tools = llm.bind_tools(
             [t for t in ALL_TOOLS if t.name in state["available_tools"]]
         )
-        response = await llm_with_tools.ainvoke(state["messages"])
+        response = await llm_with_tools.ainvoke(prompt)
     else:
-        response = await llm.ainvoke(state["messages"])
+        response = await llm.ainvoke(prompt)
 
     return {"messages": [response]}
 
@@ -236,20 +238,13 @@ async def node_generate_final(state: AgentState) -> dict:
 
 # ==================== 路由函数（纯逻辑） ====================
 
-def route_after_intent(state: AgentState) -> str:
-    """意图分类后：总是先加载记忆"""
-    return "load_memories"
-
+# 说明：把路由集中在函数里、每个函数只做 if/else，是为了让"路径由 State 决定"。
+# 不要在这里调 LLM——判断过程一旦放在路由里就不会进 State，路径也就不可回放了。
 
 def route_after_memories(state: AgentState) -> str:
     """记忆加载后：检查是否需要 RAG"""
     if state.get("_need_rag"):
         return "search_rag"
-    return "assemble_context"
-
-
-def route_after_rag(state: AgentState) -> str:
-    """RAG 检索后：进入上下文组装"""
     return "assemble_context"
 
 
@@ -274,7 +269,16 @@ def route_after_tools(state: AgentState) -> str:
 
 # ==================== 构建 Graph ====================
 
-def build_single_agent(checkpointer=None):
+def build_single_agent(checkpointer):
+    """
+    checkpointer 是**必填**参数，不给默认值。
+
+    没有 checkpointer 就没有恢复、没有跨进程续跑、没有 HITL，
+    而且只要图里挂了 checkpointer，运行时就必须传
+    config={"configurable": {"thread_id": ...}}，
+    否则抛 ValueError: Checkpointer requires one or more of the
+    following 'configurable' keys: ['thread_id', 'checkpoint_ns', 'checkpoint_id']。
+    """
     graph = StateGraph(AgentState)
 
     # 注册节点
@@ -283,11 +287,18 @@ def build_single_agent(checkpointer=None):
     graph.add_node("search_rag", node_search_rag)
     graph.add_node("assemble_context", node_assemble_context)
     graph.add_node("llm_reason", node_llm_reason)
-    graph.add_node("tools", ToolNode(ALL_TOOLS))
+    # handle_tool_errors 一定要显式给：默认值只把"模型传错参数"（ToolInvocationError）
+    # 转成 status="error" 的 ToolMessage，工具**运行时**抛的异常（连接失败、超时、
+    # 业务异常）会原样向上抛、中断本次运行。想让它变成一段回灌给模型的错误信息，
+    # 就得在这里声明要兜住的异常类型（详见第三章 3.3.3）。
+    graph.add_node(
+        "tools",
+        ToolNode(ALL_TOOLS, handle_tool_errors=(TimeoutError, ConnectionError, ToolException)),
+    )
     graph.add_node("generate_final", node_generate_final)
 
-    # 连线
-    graph.set_entry_point("classify_intent")
+    # 连线（用 START/END 声明起止，set_entry_point/set_finish_point 已弃用）
+    graph.add_edge(START, "classify_intent")
     graph.add_edge("classify_intent", "load_memories")
     graph.add_conditional_edges("load_memories", route_after_memories, {
         "search_rag": "search_rag",
@@ -305,10 +316,37 @@ def build_single_agent(checkpointer=None):
     return graph.compile(checkpointer=checkpointer)
 
 
-# 全局编译实例
-agent = build_single_agent(
-    checkpointer=RedisSaver.from_conn_string("redis://localhost:6379/2")
-)
+# ==================== 编译实例的创建时机 ====================
+
+# ❌ 不要在模块顶层这样写：
+#     agent = build_single_agent(checkpointer=RedisSaver.from_conn_string("redis://..."))
+# from_conn_string 是 @contextmanager，直接赋值拿到的是上下文管理器而不是 saver；
+# 而且首次使用必须先 setup() 建 RediSearch/RedisJSON 索引，否则运行时才报错。
+#
+# ✅ 正确做法：在应用 lifespan 里持有连接，把编译好的图挂到 app.state 上。
+#
+#     # main.py
+#     from contextlib import asynccontextmanager
+#     from fastapi import FastAPI
+#     from langgraph.checkpoint.redis.aio import AsyncRedisSaver
+#     from core.single_agent import build_single_agent
+#
+#     @asynccontextmanager
+#     async def lifespan(app: FastAPI):
+#         # 会话与 checkpointer 走 db 1，业务缓存在 db 0，两边互不干扰
+#         async with AsyncRedisSaver.from_conn_string("redis://localhost:6379/1") as saver:
+#             await saver.asetup()          # 幂等：建索引
+#             app.state.agent = build_single_agent(saver)
+#             yield
+#
+#     app = FastAPI(lifespan=lifespan)
+#
+# 调用侧：
+#     config = {"configurable": {"thread_id": session_id}}
+#     result = await app.state.agent.ainvoke(
+#         {"user_query": query, "session_id": session_id, "user_id": user_id},
+#         config=config,
+#     )
 ```
 
 ### 1.1.3 上述代码的核心设计决策
@@ -317,9 +355,52 @@ agent = build_single_agent(
 
 **决策二：记忆加载和 RAG 检索解耦为独立节点。** 记忆是"关于这个用户"的信息，RAG 是"关于这个问题"的知识——两者的检索条件和用途完全不同。解耦后可以按意图决定是否执行 RAG（闲聊不需要查知识库，省一次 Milvus 查询）。
 
-**决策三：上下文组装是单独一个节点。** 把"拼 prompt"这件事集中在一个地方，方便调试——如果 Agent 回复质量差，先看这个节点拼出来的 messages 长什么样。
+**决策三：上下文组装是单独一个节点，但它只产出 `system_prompt`。** 把"拼 system prompt"这件事集中在一个地方，方便调试——如果 Agent 回复质量差，先看这个节点拼出来的 prompt 长什么样。而对话历史不在这里重建，"拼历史"这件事交给 messages 通道（决策四）。
 
-**决策四：LLM 推理 → 工具执行 → LLM 推理，形成 ReAct 循环。** 这是 Agent 的核心：不是一次 LLM 调用就完事，而是"思考-行动-观察-再思考"的迭代过程。
+**决策四：messages 是会话历史的唯一真相。** 历史只存一份（checkpointer 按 `thread_id=session_id` 持久化），组装节点每轮只追加当轮的用户消息。这一点很容易写错，1.1.4 单独讲。
+
+**决策五：LLM 推理 → 工具执行 → LLM 推理，形成 ReAct 循环。** 这是 Agent 的核心：不是一次 LLM 调用就完事，而是"思考-行动-观察-再思考"的迭代过程。因为历史在 messages 里，循环第二轮起 LLM 能自动看到上一轮的工具结果，不需要特殊处理。
+
+### 1.1.4 一个必须避开的坑：别把"重拼的历史"写进追加型通道
+
+`messages` 是**追加语义**的通道（`Annotated[..., add_messages]`），节点返回的列表会被**合并**进已有历史，而不是替换它。于是下面这种看起来最自然的写法是错的：
+
+```python
+# ❌ 错误：把 system + 全部历史 + 本轮提问整体拼好，返回给 messages
+async def node_assemble_context(state):
+    messages = [{"role": "system", "content": ...}]
+    for msg in state["short_term_context"]:     # 从 Redis 取来的历史
+        messages.append(msg)
+    messages.append({"role": "user", "content": state["user_query"]})
+    return {"messages": messages}               # ← 被"追加"进已有历史
+```
+
+第一轮正常。但 checkpointer 会把 `messages` 存下来，第二轮开始，`messages` 里已经有第一轮的全套消息，这个节点又追加一份"重拼的全套"——于是 system prompt 与旧对话成倍复制：
+
+| 轮次 | messages 里实际有什么 | system prompt 份数 |
+|------|---------------------|------------------|
+| 第 1 轮 | 重拼 1 份 | 1 |
+| 第 2 轮 | 第 1 轮 1 份 + 重拼 1 份 | 2 |
+| 第 3 轮 | 前两轮 + 重拼 1 份 | 3 |
+
+后果是 checkpoint 体积与 token 成本随轮次线性上涨，而**回复内容看起来完全正常**——不报错、不变慢到明显察觉，只有账单和上下文长度在悄悄涨。
+
+两种正确写法：
+
+```python
+# ✅ 写法 A（本章采用）：历史不重建，只追加"增量"
+#    组装节点产出 system_prompt 与当轮用户消息，历史由 messages 通道维护
+return {
+    "system_prompt": "\n".join(system_parts),
+    "messages": [HumanMessage(content=state["user_query"])],
+}
+
+# ✅ 写法 B：确实需要在节点里拼整段 prompt 时，用普通字段（覆盖语义）承载，
+#    不要用追加型通道
+return {"llm_input": messages}     # llm_input 未声明 reducer → 新值替换旧值
+```
+
+**一句话：追加型通道只放"增量"，要放"全量"就用覆盖型字段。**
 
 ---
 
@@ -330,32 +411,41 @@ agent = build_single_agent(
 
  0ms  │  用户请求到达
       │
- 20ms │  ① classify_intent    → intent=action, need_tools=true, need_rag=false
-      │                          （"查退款"是操作，不是提问，不需要 RAG）
+ 5ms  │  ① classify_intent    → intent=action, need_tools=true, need_rag=false
+      │     （走小模型约 150~300ms；走规则/关键词命中可 <5ms）
+      │     （"查退款"是操作，不是提问，不需要 RAG）
       │
- 60ms │  ② load_memories      → 短期：刚才聊到蓝牙耳机退款
-      │                          → 长期：用户是 VIP，偏好简洁回复
+ 250ms│  ② load_memories      → 长期：用户是 VIP，偏好简洁回复
       │                          → 长期：用户最近有一笔订单 ORD-88483
+      │     （检索前要对 query 做一次 embedding，是一次外部 API 往返）
       │
- 80ms │  ③ route: need_rag=false → 跳过 search_rag
+ 255ms│  ③ route: need_rag=false → 跳过 search_rag
       │
- 100ms│  ④ assemble_context    → 组装 system prompt + 长期记忆 + 短期记忆 + query
-      │                          system prompt 包含：可用工具 = [order_tool]
+ 260ms│  ④ assemble_context    → 产出 system prompt（含长期记忆、工具提示）
+      │                          并把本轮用户消息追加进 messages
       │
- 200ms│  ⑤ llm_reason (第1次)  → LLM 决定调 order_tool(action="search", order_id="ORD-88483")
+ 900ms│  ⑤ llm_reason (第1次)  → LLM 决定调 order_tool(action="search", order_id="ORD-88483")
       │
- 230ms│  ⑥ tools               → 执行 order_tool → 返回"订单 ORD-88483：退款 299 元，状态：处理中，
-      │                          预计 3 个工作日内到账"
+1150ms│  ⑥ tools               → 执行 order_tool → 返回"订单 ORD-88483：退款 299 元，
+      │                          状态：处理中，预计 3 个工作日内到账"
       │
- 330ms│  ⑦ llm_reason (第2次)  → LLM 看到工具结果，决定不再调工具，生成回复
+3200ms│  ⑦ llm_reason (第2次)  → LLM 看到工具结果，决定不再调工具，生成回复
       │                          "您的退款 299 元正在处理中，预计 3 个工作日内原路退回。"
       │
- 340ms│  ⑧ generate_final      → 提取最终回复
+3210ms│  ⑧ generate_final      → 提取最终回复
       │
- 350ms│  → 返回给用户
+3210ms│  → 返回给用户
 ```
 
-**总耗时约 350ms。** 其中两次 LLM 推理（⑤和⑦）占了大头（每条约 100ms，实际取决于模型速度）；其余节点（①~④、⑥、⑧）都是固定开销，单步在 50ms 以内。
+**总耗时约 3 秒（其中首 token 约 0.9 秒）。** 拆开看，时间几乎全花在两次 LLM 推理上（⑤、⑦），其余节点是固定开销。
+
+这张表要读出的判断有三条，比绝对数字重要：
+
+1. **两次 LLM 推理占了大头**，而第二次的输入比第一次更长（多了工具结果），所以第二次的 prefill 会更慢。想压延迟，先压 LLM 调用次数与 prompt 长度，而不是去优化那 5ms 的节点调度。
+2. **"长期记忆检索"不是免费操作。** 它必须先对 query 做一次 embedding，那是一次外部 API 往返（100~300ms）。对延迟敏感的场景应把它与意图分类**并行**，而不是串在后面。
+3. **上表是单轮、无重试、网络顺畅的情况。** 真实 P99 要算上工具超时重试、LLM 重试、RAG 的 rerank 外网调用——量级往往是中位数的 3~5 倍。做容量规划时不能用平均值。
+
+**想让首 token 更快，只有两条路**（其余都是微调）：把流式打开（用户先看到字，感知延迟从"总耗时"降到"首 token"），以及把可以并行的检索/分类并行起来。
 
 ---
 
@@ -381,57 +471,73 @@ Agent 推理 → 调用 send_email(
 
 LangGraph 提供两种"暂停"机制，容易混淆，先分清：
 
-1. **`compile(interrupt_before=[...])`（节点前暂停）**：编译时声明在哪些节点执行前暂停。运行时工作流会在该节点前停住并**正常返回状态快照（不抛异常）**，State 已保存到 checkpointer；恢复时用同一个 `thread_id` 再调用 `agent.ainvoke(None)` 即可。
-2. **`interrupt()`（节点内暂停）**：只有节点内部调用 `interrupt()` 函数时，才会抛出 `GraphInterrupt` 异常，把控制权交回外部循环。适用于"执行到一半需要人来拍板"的动态场景。
+1. **`interrupt()`（节点内暂停）**：在节点内部调用，由图自己决定"要不要停、停在哪、带什么信息给人看"。停不下来的时候它并不向调用方抛异常——见下面的机制说明。**本章主推这一种**，因为"哪些工具需要确认"是运行时才知道的动态判断（1.3.3 的危险等级路由正是这种情况）。
+2. **`compile(interrupt_before=[...])`（节点前暂停）**：编译时静态声明在哪些节点执行前暂停。适合"这个节点每次都必须人工过一遍"的固定审批点；代价是它不携带上下文（人看不到模型想干什么），且需要在图里专门放一个空节点当"汇合点"。
 
-本章主推第一种（`interrupt_before`），因为它把"哪些节点需要确认"集中声明在编译参数里，结构清晰。下面的示例展示"读取状态 + 恢复执行"这套 API：
+**关于 `interrupt()` 的异常语义，这是最容易搞错的一点：**
+
+| 说法 | 是否成立 |
+|------|---------|
+| 节点内部 `interrupt()` 会抛 `GraphInterrupt` | ✅ 成立，但那是框架内部实现 |
+| 这个异常会传播到调用 `ainvoke` 的地方，需要 try/except | ❌ **不成立** |
+
+从调用方视角看，`interrupt()` 挂起时 `ainvoke` 是**正常返回**的，结果里带一个 `__interrupt__` 字段：
 
 ```python
-# 注意：build_single_agent 本身没有配置 interrupt_before，
-# 下面的示例只能演示读取/恢复状态的 API 用法；
-# 真正带中断的图在 1.3.4（中断点设在 human_approval 节点前）。
-agent = build_single_agent(
-    checkpointer=RedisSaver.from_conn_string("redis://localhost:6379/2"),
-)
+result = await agent.ainvoke(input, config=config)
+payload = result["__interrupt__"][0].value     # ← 中断载荷在这里，不是异常
+```
 
-# ============ 运行时 ============
+恢复也不是"抛了异常所以重试"，而是显式地把人的决定送回去：
 
-# 1. 正常执行。若 graph 在 compile 时配了 interrupt_before，
-#    执行到中断点时会【正常返回状态快照】（不抛异常），
-#    State 保存到 checkpointer，等外部用同一个 thread_id 恢复。
+```python
+from langgraph.types import Command
+
+result = await agent.ainvoke(Command(resume=True), config=config)   # True = 批准
+```
+
+```python
+# ============ 完整流程：读状态 → 人审 → 恢复 ============
+
 config = {"configurable": {"thread_id": session_id}}
 
+# 1. 第一次执行：跑到审批点会挂起，ainvoke 正常返回（不抛异常）
 result = await agent.ainvoke(
-    {"user_query": "帮我给全公司发邮件通知明天放假", ...},
+    {
+        "user_query": "帮我给全公司发邮件通知明天放假",
+        "session_id": session_id,
+        "user_id": user_id,
+    },
     config=config,
 )
 
-# 2. 读取当前 State（若在中断点暂停，这里能看到 Agent 打算执行的 tool_calls）
-current_state = await agent.aget_state(config)
-pending_tool_calls = current_state.values["messages"][-1].tool_calls
-print(f"Agent 想要执行：{pending_tool_calls}")
-# → [{name: "send_email", args: {to: "all@company.com", ...}}]
+# 2. 取出中断载荷——这才是"要给人看的东西"
+interrupt_payload = result["__interrupt__"][0].value
+# → {"type": "review_required", "tool": "send_email",
+#    "args": {"to": "all@company.com", "subject": "明天放假"}}
 
-# 3. 人工审核：展示给用户确认
-# 前端弹窗："Agent 想要发送邮件给全公司，确认吗？"
+# 3. 前端弹窗："Agent 想要发送邮件给全公司，确认吗？"
 
-# 4a. 用户点"确认" → 用同一个 thread_id 恢复执行
-await agent.aupdate_state(
-    config,
-    {"human_approved": True},   # 注入审批结果
+# 4a. 用户点"确认" → 把决定送回去，图从挂起点继续
+result = await agent.ainvoke(Command(resume=True), config=config)
+
+# 4b. 用户点"拒绝" → 同时把"改过的意见"送回去，让模型据此改道
+result = await agent.ainvoke(
+    Command(resume={"approved": False, "feedback": "不要提放假，改成通知明早 9 点开会"}),
+    config=config,
 )
-result = await agent.ainvoke(None, config=config)  # 从断点继续
 
-# 4b. 用户点"拒绝" → 修改 State，走向另一个分支
-await agent.aupdate_state(
-    config,
-    {
-        "human_approved": False,
-        "messages": [{"role": "system", "content": "用户拒绝了发送邮件的操作，请告知用户操作已取消。"}],
-    },
-)
-result = await agent.ainvoke(None, config=config)
+# 补充：想在恢复前先看一眼"模型打算干什么"，用 aget_state 读快照
+snapshot = await agent.aget_state(config)
+pending_tool_calls = snapshot.values["messages"][-1].tool_calls
 ```
+
+**注意：`interrupt()` 恢复时会从该节点重新执行**，所以 `interrupt()` 之前的代码会被跑第二遍——审批节点里不要放发消息、写库这类有副作用的操作（同一条约束在 1.4 的 Plan 评审里也适用）。
+
+**如果坚持用 `interrupt_before` 做审批**，有两点必须补上，否则示例跑不通：
+
+- **给图配一个审批汇合节点**，否则中断后没有可恢复的落点；
+- **`aupdate_state` 只能更新 State 里已声明的字段**。像 `human_approved` 这种注入字段，必须先写进 `AgentState`（本章 1.1.2 的 State 定义里已经声明）——往未声明的键写数据会被忽略，表现为"点了确认但图的行为没变"，很难查。
 
 ### 1.3.3 更精细的做法：按工具的危险等级控制
 
@@ -487,49 +593,120 @@ def route_tool_approval(state: AgentState) -> str:
 
 ### 1.3.4 完整示例：带审批的 Agent Graph
 
+**注意这个示例与 1.1.2 的关系：审批图不是"原图 + `interrupt_before`"，而是把审批当成一个真实节点接进路由。** 这样做的好处是审批节点能看到 State（知道模型打算调哪个工具、带什么参数），人的决定也能作为数据写回 State。
+
 ```python
-def build_agent_with_approval():
+from langgraph.types import interrupt
+
+
+def route_after_approval(state: AgentState) -> str:
+    """审批后的分流：批准 → 执行工具；拒绝 → 回到 LLM 重新决策"""
+    if state.get("write_authorized"):
+        return "tools"
+    return "llm_reason"
+
+
+def build_agent_with_approval(checkpointer):
     graph = StateGraph(AgentState)
 
-    # 原有节点...
+    # ---- 原有节点（与 1.1.2 一致）----
     graph.add_node("classify_intent", node_classify_intent)
     graph.add_node("load_memories", node_load_memories)
+    graph.add_node("search_rag", node_search_rag)
     graph.add_node("assemble_context", node_assemble_context)
     graph.add_node("llm_reason", node_llm_reason)
-    graph.add_node("tools", ToolNode(ALL_TOOLS))
+    graph.add_node(
+        "tools",
+        ToolNode(ALL_TOOLS, handle_tool_errors=(TimeoutError, ConnectionError, ToolException)),
+    )
     graph.add_node("generate_final", node_generate_final)
 
-    # 新增：人工审批节点
+    # ---- 新增：人工审批节点（用 interrupt() 挂起）----
     async def node_human_approval(state: AgentState) -> dict:
         """
-        人工审批节点。
+        审批节点。
 
-        interrupt_before 恢复时，这个节点【会被真正执行】——
-        只不过它返回空更新 {}，没有任何副作用，所以看起来"像没执行"。
+        两个要点：
+        1. interrupt() **之前**不要放副作用——恢复时本节点会从头重跑一遍；
+        2. 人的决定不是"异常恢复"，而是作为 interrupt() 的返回值送进来
+           （由外部用 Command(resume=...) 提供）。
         """
-        return {}  # 空更新：只作为"审批通过"的汇合点，不改动 State
+        last_message = state["messages"][-1]
+
+        decision = interrupt({
+            "type": "tool_approval_required",
+            "tool_calls": [
+                {"name": tc["name"], "args": tc["args"]} for tc in last_message.tool_calls
+            ],
+        })
+
+        if not decision.get("approved"):
+            # 人拒绝了：把反馈作为一条消息回灌，让模型据此改道，
+            # 而不是直接把流程掐断——多数情况下用户想要的是"换个做法"，不是"别做了"
+            return {
+                "messages": [HumanMessage(
+                    content=(
+                        "用户拒绝执行该操作。"
+                        f"反馈：{decision.get('feedback', '无')}。请据此调整方案，不要重复同样的调用。"
+                    )
+                )]
+            }
+
+        return {"write_authorized": True}   # 批准：记下授权，同会话内的写操作不再反复打断
 
     graph.add_node("human_approval", node_human_approval)
 
-    # 关键：llm_reason 后，根据工具危险等级路由
-    graph.add_conditional_edges(
-        "llm_reason",
-        route_tool_approval,
-        {
-            "tools": "tools",
-            "human_approval": "human_approval",
-            "generate_final": "generate_final",
-        },
-    )
-    graph.add_edge("tools", "llm_reason")
-    graph.add_edge("human_approval", "tools")  # 审批通过后 → 执行工具
+    # ---- 连线：要把整张图连通，不能只连新增部分 ----
+    graph.add_edge(START, "classify_intent")
+    graph.add_edge("classify_intent", "load_memories")
+    graph.add_conditional_edges("load_memories", route_after_memories, {
+        "search_rag": "search_rag",
+        "assemble_context": "assemble_context",
+    })
+    graph.add_edge("search_rag", "assemble_context")
+    graph.add_edge("assemble_context", "llm_reason")
+
+    # llm_reason 后：按工具危险等级分流
+    graph.add_conditional_edges("llm_reason", route_tool_approval, {
+        "tools": "tools",
+        "human_approval": "human_approval",
+        "generate_final": "generate_final",
+    })
+    graph.add_edge("tools", "llm_reason")       # ← ReAct 循环
+    graph.add_conditional_edges("human_approval", route_after_approval, {
+        "tools": "tools",
+        "llm_reason": "llm_reason",
+    })
     graph.add_edge("generate_final", END)
 
-    return graph.compile(
-        checkpointer=RedisSaver.from_conn_string("redis://localhost:6379/2"),
-        interrupt_before=["human_approval"],  # ← 在这个节点前暂停
-    )
+    # interrupt() 必须有 checkpointer 才能工作：没有持久化就没有"挂起后恢复"这回事
+    return graph.compile(checkpointer=checkpointer)
 ```
+
+```python
+# 编译实例同样在 lifespan 里创建（见 1.1.2 末尾），不要在这里直接建 Redis 连接
+app.state.agent = build_agent_with_approval(saver)
+
+# 调用侧：危险工具会挂起，ainvoke 正常返回并带 __interrupt__
+result = await app.state.agent.ainvoke(
+    {
+        "user_query": "帮我给全公司发邮件通知明天放假",
+        "session_id": session_id,
+        "user_id": user_id,
+    },
+    config={"configurable": {"thread_id": session_id}},
+)
+if "__interrupt__" in result:
+    payload = result["__interrupt__"][0].value      # 交给前端弹窗
+
+# 用户确认后
+result = await app.state.agent.ainvoke(
+    Command(resume={"approved": True}),
+    config={"configurable": {"thread_id": session_id}},
+)
+```
+
+**图不完整的两个典型症状**（都是编译期就报错，比运行时崩好查）：注册了节点却没有入口（漏了 `add_edge(START, ...)`），或节点没有任何出边（注册了却没接线）。改图时最容易漏的就是这两处。
 
 ---
 
@@ -620,18 +797,28 @@ from typing import TypedDict, Annotated
 from operator import add
 from pydantic import BaseModel, Field
 from langchain_openai import ChatOpenAI
-from langgraph.graph import StateGraph, END
+from langgraph.graph import StateGraph, START, END
 from langgraph.prebuilt import ToolNode
+from langgraph.types import interrupt
 
 
 # ==================== 计划的数据结构 ====================
 
 class PlanStep(BaseModel):
+    """
+    计划中的一步。
+
+    注意可选字段的默认值写法：`with_structured_output(Plan)` 默认走 strict
+    Structured Outputs，它**不接受非 null 的默认值，也不接受 `default_factory`**
+    ——写成 `tool_name: str = ""` 或 `depends_on: list[int] = Field(default_factory=list)`
+    会直接 400（`Invalid schema for response_format`）。
+    可选字段统一写成 `X | None = Field(default=None)`（详见第三章 4.4.2）。
+    """
     step_id: int
     description: str
-    tool_name: str = Field(default="")  # 此步骤需要调用的工具
-    depends_on: list[int] = Field(default_factory=list)  # 依赖的前置步骤
-    status: str = "pending"  # pending / in_progress / completed / failed
+    tool_name: str | None = Field(default=None, description="此步骤需要调用的工具名，不需要工具时留空")
+    depends_on: list[int] | None = Field(default=None, description="依赖的前置步骤 id 列表")
+    status: str | None = Field(default=None, description="pending / in_progress / completed / failed")
 
 
 class Plan(BaseModel):
@@ -644,15 +831,16 @@ class Plan(BaseModel):
 class PlanAndExecuteState(TypedDict):
     user_query: str
     plan: Plan
-    completed_steps: Annotated[list[dict], add]  # 已完成步骤的结果
-    current_step: int                             # 当前正在执行的步骤 ID
+    completed_steps: Annotated[list[dict], add]  # 已完成步骤的结果（追加语义，放增量）
+    current_step: int                             # 下一步要执行的步骤 id（由 execute_step 写回）
+    plan_feedback: str | None                     # 用户对上一版计划的修改意见（评审未通过时写入）
     final_output: str
     messages: Annotated[list, add]
 
 
 # ==================== 阶段一：生成计划 ====================
 
-planning_llm = ChatOpenAI(model="gpt-4o").with_structured_output(Plan)
+planning_llm = ChatOpenAI(model="gpt-5.1").with_structured_output(Plan)
 
 PLANNING_PROMPT = """你是一个任务规划助手。将用户的复杂任务拆解为 3~7 个具体可执行的步骤。
 
@@ -674,11 +862,16 @@ PLANNING_PROMPT = """你是一个任务规划助手。将用户的复杂任务�
 
 
 async def node_plan(state: PlanAndExecuteState) -> dict:
-    """生成执行计划"""
-    plan = await planning_llm.ainvoke(
-        PLANNING_PROMPT.format(query=state["user_query"])
-    )
-    return {"plan": plan}
+    """生成执行计划。若上一版计划被用户要求修改，把意见一并带上重出。"""
+    prompt = PLANNING_PROMPT.format(query=state["user_query"])
+
+    if state.get("plan_feedback"):
+        prompt += f"\n\n## 用户对上一版计划的修改意见（必须采纳）\n{state['plan_feedback']}"
+
+    plan = await planning_llm.ainvoke(prompt)
+
+    # 消费掉反馈：不清掉的话，后续每次重出计划都会把旧意见再带一遍
+    return {"plan": plan, "plan_feedback": None}
 
 
 # ==================== 阶段二（可选）：计划评审 ====================
@@ -686,11 +879,32 @@ async def node_plan(state: PlanAndExecuteState) -> dict:
 async def node_review_plan(state: PlanAndExecuteState) -> dict:
     """
     计划评审——让用户确认计划。
-    
-    此节点在 interrupt_before 列表里，执行前会暂停，
-    前端展示计划后等用户确认。
+
+    与 1.3.4 的审批节点同理：用 interrupt() 挂起，把计划本身作为载荷给人看，
+    人的决定通过 Command(resume=...) 送回来。这比 interrupt_before + 空节点
+    那套绕法好在"要确认什么"和"计划长什么样"在同一个节点里，且拒绝之后
+    有明确的回流路径（回到 plan 重出），不会把人拒绝这件事静默吞掉。
     """
-    return {}  # 空函数体，因为执行前已通过 interrupt 暂停
+    decision = interrupt({
+        "type": "plan_review_required",
+        "goal": state["plan"].goal,
+        "steps": [
+            {"step_id": s.step_id, "description": s.description, "tool_name": s.tool_name}
+            for s in state["plan"].steps
+        ],
+    })
+
+    if decision.get("approved"):
+        return {}
+
+    return {"plan_feedback": decision.get("feedback", "用户未说明理由，请换一个更稳妥的拆解方式")}
+
+
+def route_after_review(state: PlanAndExecuteState) -> str:
+    """评审后：通过 → 开始执行；要求修改 → 回到 plan 重出计划"""
+    if state.get("plan_feedback"):
+        return "plan"
+    return "execute_step"
 
 
 # ==================== 阶段三：逐步执行 ====================
@@ -764,6 +978,10 @@ async def node_execute_step(state: PlanAndExecuteState) -> dict:
 
     return {
         "messages": messages,
+        # 关键：把"下一步该做第几步"写回 State。
+        # 路由函数只读 State 做判断，不会自己累加计数器——不写回这一步，
+        # current_step 永远是 1，计划会在第一步上无限循环直到 GraphRecursionError。
+        "current_step": current + 1,
         "completed_steps": [{
             "step_id": current,
             "description": step.description,
@@ -774,18 +992,24 @@ async def node_execute_step(state: PlanAndExecuteState) -> dict:
 
 
 def route_after_execute(state: PlanAndExecuteState) -> str:
-    """执行完一个步骤后，判断下一步"""
-    total_steps = len(state["plan"].steps)
-    current = state.get("current_step", 1)
+    """
+    执行完一个步骤后，判断下一步。
 
-    # 检查当前步骤是否真的完成了
+    路由函数**只读 State**：下一步是"第几步"由 execute_step 写入 current_step，
+    这里不重新推算（同 1.1.2 的约定，理由也一样——路由自己算的进度不在 State 里，
+    路径就不可回放、恢复后也会算错）。
+    """
+    total_steps = len(state["plan"].steps)
+    next_step = state.get("current_step", 1)     # execute_step 已在完成后 +1
+
+    # 检查上一步是否真的完成了（失败分支同理：没完成就重试当前步骤）
     last_completed = state["completed_steps"][-1] if state["completed_steps"] else None
-    if last_completed and last_completed["status"] == "completed":
-        if current >= total_steps:
-            return "assemble_final"
-        return "execute_step"  # 继续下一步
-    else:
-        return "execute_step"  # 重试当前步骤
+    if last_completed is None or last_completed["status"] != "completed":
+        return "execute_step"                     # 重试当前步骤
+
+    if next_step > total_steps:
+        return "assemble_final"                   # 全部完成
+    return "execute_step"                         # 继续下一步
 
 
 async def node_assemble_final(state: PlanAndExecuteState) -> dict:
@@ -812,7 +1036,7 @@ async def node_assemble_final(state: PlanAndExecuteState) -> dict:
 
 # ==================== 构建 Plan-and-Execute Graph ====================
 
-def build_plan_and_execute_agent():
+def build_plan_and_execute_agent(checkpointer):
     graph = StateGraph(PlanAndExecuteState)
 
     graph.add_node("plan", node_plan)
@@ -820,11 +1044,14 @@ def build_plan_and_execute_agent():
     graph.add_node("execute_step", node_execute_step)
     graph.add_node("assemble_final", node_assemble_final)
 
-    graph.set_entry_point("plan")
+    graph.add_edge(START, "plan")
 
-    # plan → review（可选人工确认）→ execute
+    # plan → review（人工确认）→ 通过则 execute，被要求修改则回到 plan
     graph.add_edge("plan", "review_plan")
-    graph.add_edge("review_plan", "execute_step")
+    graph.add_conditional_edges("review_plan", route_after_review, {
+        "execute_step": "execute_step",
+        "plan": "plan",
+    })
 
     # 循环执行直到所有步骤完成
     graph.add_conditional_edges("execute_step", route_after_execute, {
@@ -833,10 +1060,25 @@ def build_plan_and_execute_agent():
     })
     graph.add_edge("assemble_final", END)
 
-    return graph.compile(
-        checkpointer=RedisSaver.from_conn_string("redis://localhost:6379/3"),
-        interrupt_before=["review_plan"],  # ← 计划确认点
-    )
+    return graph.compile(checkpointer=checkpointer)
+
+
+# 调用侧（同样在 lifespan 里建 checkpointer）
+# graph = build_plan_and_execute_agent(saver)
+# result = await graph.ainvoke(
+#     {"user_query": "帮我写一份竞品分析报告", "current_step": 1, "completed_steps": []},
+#     config={"configurable": {"thread_id": session_id}, "recursion_limit": 60},
+# )
+#
+# 必须显式传 current_step 的初值 1，否则第一轮 route_after_execute 读到缺键、
+# 退回默认值后行为就取决于"你写没写默认值"——这类隐式默认是排查噩梦的源头。
+#
+# recursion_limit 也要按计划长度给够：默认 25 个 super-step，一个 N 步的计划
+# 每步至少 2 个 super-step（execute_step + 路由判断），N 大时会先撞上
+# GraphRecursionError 而不是正常结束。
+#
+# 另注：本模块用到的 llm / ALL_TOOLS 来自 core/single_agent.py 的模块级定义
+# （同一个项目骨架里共享同一份 LLM 客户端与工具注册表），不是本文件里新造的。
 ```
 
 ### 1.4.4 Plan-and-Execute vs ReAct：什么时候用哪个
@@ -862,12 +1104,16 @@ def route_after_classify(state: AgentState) -> str:
     - 简单任务 → ReAct 循环
     - 复杂任务 → Plan-and-Execute
     """
-    # 复杂任务的关键词特征（实际项目中可以训练分类器）
+    # ❌ 关键词匹配只是"能跑通"的教学写法，不要直接上生产：
+    #    "帮我调研一下这个报错" 不含任何关键词却需要多步调研，
+    #    "分析一下我这句话有没有错别字" 含"分析"却是一步就能答完。
+    # ✅ 生产做法：让分类模型输出一个结构化字段（如 complexity: simple|complex）
+    #    并写入 State，路由只读 State 做判断——与 1.1.2 的约定一致。
     complex_keywords = ["报告", "分析", "调研", "总结", "对比", "方案", "计划"]
     query = state["user_query"]
-    
+
     is_complex = any(kw in query for kw in complex_keywords)
-    
+
     if is_complex:
         return "plan_mode"
     return "react_mode"
@@ -931,6 +1177,7 @@ Plan-and-Execute 的时间线：
 |------|---------|--------|
 | 单 Agent 决策链 | 意图分类 → 记忆加载 → RAG 检索 → 上下文组装 → LLM 推理 ↔ 工具执行 | 四个问题依次回答：想干什么、知道什么、需要什么知识、要执行什么操作 |
 | 子系统解耦 | 记忆、RAG、工具各自独立节点，按意图条件路由 | 不需要的子系统不调用，省延迟、省 token |
-| Human-in-the-Loop | `interrupt_before` + 工具危险等级分类 + 人工确认后 `aupdate_state` 恢复 | 不可逆操作必须人拍板，机器做建议，人做决策 |
-| Plan-and-Execute | Plan（生成计划）→ Review（可选 HITL）→ Execute（逐步执行+验证） | 复杂任务先想清楚再动手，避免 ReAct 的"走一步看一步"偏航 |
+| 会话历史归属 | `messages` 是唯一真相（checkpointer 按 `thread_id=session_id` 持久化），组装节点只产出 `system_prompt` 与当轮用户消息 | 追加型通道只放增量：把"重拼的全量历史"写进去，每轮都会复制一份（见 1.1.4） |
+| Human-in-the-Loop | `interrupt()`（动态判断，主推）+ `Command(resume=...)` 恢复；`interrupt_before` 只用于静态固定审批点 | 挂起时 `ainvoke` 正常返回、结果带 `__interrupt__`，不要写 try/except；恢复会重跑该节点，前面别放副作用 |
+| Plan-and-Execute | Plan（生成计划）→ Review（可选 HITL）→ Execute（逐步执行） | 复杂任务先想清楚再动手，避免 ReAct 的"走一步看一步"偏航 |
 | 两者关系 | Plan-and-Execute 管理任务复杂度，HITL 管理操作风险度 | 不同维度，叠加使用：计划让人审方向，执行让人审操作 |

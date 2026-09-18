@@ -37,7 +37,7 @@
 |:---:|:---|
 | 🏭 **工业界标准** | 每个主题都从生产环境的真实要求出发，而不是玩具 Demo |
 | ❌ **先看错误示范** | 先展示"课堂典型写法"为什么在生产上会出事，再讲正确做法——强约定 |
-| ✅ **完整可运行代码** | 所有示例均为 Python 3.13+ 异步风格，可直接落地到项目骨架 |
+| ✅ **代码围绕统一骨架** | 示例为 Python 3.13+ 异步风格，按 `core/` + `routes/` + `services/` 的统一骨架编写；跨文件符号按骨架约定引用（见 `CLAUDE.md`） |
 | 🧪 **测试与运维并重** | 不止"怎么写"，还讲"怎么测"和"怎么运维" |
 
 > 🎯 **目标读者**：具备一定编程基础的开发者。全书以 **「工业界标准 → 为什么课堂不教 → 你应该怎么写」** 为叙事线。
@@ -78,7 +78,13 @@ cd build_a_product_agent
 # 4. 第4章：Agent通路（单Agent与多Agent协作）
 # 5. 第5章：系统测试（上线前的测试体系）
 # 6. 第6章：AI Infra 基座（模型部署与选型）
+
+# 文档自检（校验全文示例代码块：语法 / YAML / 语言标注 / 已弃用 API）
+pip install pyyaml
+python scripts/check_snippets.py
 ```
+
+> 手册的硬约定是"示例代码能跑"，所以仓库带一个静态校验闸门：`scripts/check_snippets.py` 会把所有代码块抽出来跑语法检查、YAML 解析，并扫描已弃用 API（`set_entry_point`、`create_react_agent`、`from langchain.retrievers`、`RedisSaver.from_conn_string` 当实例用……）。ERROR 表示示例本身有问题，WARN 表示引用了 `core/` 骨架里的跨文件符号、需要人工确认。提交前请保证 ERROR 为 0。
 
 ---
 
@@ -86,10 +92,10 @@ cd build_a_product_agent
 
 | 章节 | 主题 | 一句话看点 |
 |:---:|:---|:---|
-| 🏗️ **第1章** | 技术选型 | 语言 / 框架 / 中间件 / 协议 / 运维架构的全套选型逻辑 |
+| 🏗️ **第1章** | 技术选型 | 语言 / 框架 / 中间件 / 协议（MCP + A2A）/ 运维架构的全套选型逻辑 |
 | 📐 **第2章** | 开发基本要求 | `.env`、Redis、async、日志、异常处理、类型注解的生产级习惯 |
 | 🧩 **第3章** | 模块开发 | 对话接口 / 记忆 / 工具 / 工作流 / RAG 五大模块逐个击破 |
-| 🤖 **第4章** | Agent 通路 | 单 Agent 完整通路 + Multi-Agent（A2A 协议）协作机制 |
+| 🤖 **第4章** | Agent 通路 | 单 Agent 完整通路（含 HITL、Plan-and-Execute）+ Multi-Agent（A2A 1.0）协作机制 |
 | 🧪 **第5章** | 系统测试 | 功能 / 质量 / 安全 / 性能 / 上线五维测试体系 |
 | 🖥️ **第6章** | AI Infra 基座 | 模型部署运维 + 三层模型选型架构 |
 
@@ -100,7 +106,7 @@ cd build_a_product_agent
 |:---|:---|
 | `01-技术选型.md` | 语言、框架、Agent 编排工具选型 |
 | `02-中间件选型.md` | 数据库、缓存、消息队列选型 |
-| `03-协议与架构模式选型.md` | API 协议、通信模式、架构风格 |
+| `03-协议与架构模式选型.md` | MCP（工具与上下文接入）、A2A（Agent 间协作）、通信模式、架构风格 |
 | `04-运维架构选型.md` | 部署、监控、日志、容灾 |
 
 </details>
@@ -122,8 +128,8 @@ cd build_a_product_agent
 | `01-对话接口.md` | 流式/非流式、session 隔离、异步高并发 |
 | `02-长期记忆与短期记忆.md` | Milvus + Redis 组合使用 |
 | `03-工具开发.md` | LangChain tool 定义、调用准确性 |
-| `04-工作流.md` | LangGraph StateGraph、结构化输出 |
-| `05-RAG系统.md` | 检索增强生成最佳实践 |
+| `04-工作流.md` | LangGraph StateGraph、结构化输出、checkpointer 与断点续跑 |
+| `05-RAG系统.md` | 检索增强生成最佳实践 + 检索效果度量（Recall@k / nDCG / MRR） |
 
 </details>
 
@@ -133,7 +139,7 @@ cd build_a_product_agent
 | 文件 | 内容 |
 |:---|:---|
 | `01-单Agent系统通路.md` | 单 Agent 的完整实现路径 |
-| `02-Multi-Agent协作机制.md` | A2A 协议、多 Agent 协作模式 |
+| `02-Multi-Agent协作机制.md` | A2A 协议（规范 1.0.0）、多 Agent 协作模式 |
 
 </details>
 
@@ -161,19 +167,31 @@ cd build_a_product_agent
 
 ## 技术栈
 
-> 全书示例代码围绕以下技术栈展开，版本为手册的最低基准：
+> **版本是"校对当日的基线快照"，不是下限声明。** 生态半年就会前移一代（LangChain 1.x 已把 chains/retrievers 迁到 `langchain-classic`，`create_react_agent` 已弃用，pymilvus 3.x 要求改用 `MilvusClient`），请对照自己的锁定版本核对 API，不要只看版本号。
 
-| 领域 | 选型 | 版本要求 |
-|:---:|:---:|:---:|
-| 语言 | ![Python](https://img.shields.io/badge/Python-3.13+-3776AB?style=flat&logo=python&logoColor=white) | 3.13+ |
-| Web 框架 | ![FastAPI](https://img.shields.io/badge/FastAPI-%E2%89%A50.136-009688?style=flat&logo=fastapi&logoColor=white) | ≥ 0.136 |
-| Agent 编排 | ![LangGraph](https://img.shields.io/badge/LangGraph-%E2%89%A51.2-1C3C3C?style=flat&logo=langchain&logoColor=white) | ≥ 1.2 |
-| LLM 工具层 | ![LangChain](https://img.shields.io/badge/LangChain-%E2%89%A51.3-1C3C3C?style=flat&logo=langchain&logoColor=white) | ≥ 1.3 |
-| 数据校验 | ![Pydantic](https://img.shields.io/badge/Pydantic-%E2%89%A52.13-E92063?style=flat&logo=pydantic&logoColor=white) | ≥ 2.13 |
-| 业务数据库 | ![PostgreSQL](https://img.shields.io/badge/PostgreSQL-4169E1?style=flat&logo=postgresql&logoColor=white) | — |
-| 缓存 / 会话 / 限流 | ![Redis](https://img.shields.io/badge/Redis-DC382D?style=flat&logo=redis&logoColor=white) | — |
-| 向量库（长期记忆） | ![Milvus](https://img.shields.io/badge/Milvus-00A1F0?style=flat&logo=milvus&logoColor=white) | — |
-| 消息队列 | ![RabbitMQ](https://img.shields.io/badge/RabbitMQ-FF6600?style=flat&logo=rabbitmq&logoColor=white) | — |
+**基线（校对于 2026-09）**
+
+| 领域 | 选型 | 基线 | 备注 |
+|:---:|:---:|:---:|:---|
+| 语言 | ![Python](https://img.shields.io/badge/Python-3.14-3776AB?style=flat&logo=python&logoColor=white) | 3.14（3.13 亦可） | 3.13 的 bugfix 窗口 2026-10 结束，之后仅安全修复 |
+| Web 框架 | ![FastAPI](https://img.shields.io/badge/FastAPI-0.141-009688?style=flat&logo=fastapi&logoColor=white) | 0.141 | |
+| Agent 编排 | ![LangGraph](https://img.shields.io/badge/LangGraph-1.2-1C3C3C?style=flat&logo=langchain&logoColor=white) | 1.2 | `set_entry_point`、`create_react_agent` 均已弃用 |
+| LLM 工具层 | ![LangChain](https://img.shields.io/badge/LangChain-1.4-1C3C3C?style=flat&logo=langchain&logoColor=white) | 1.4 | 新 Agent 用 `langchain.agents.create_agent` |
+| 数据校验 | ![Pydantic](https://img.shields.io/badge/Pydantic-2.13-E92063?style=flat&logo=pydantic&logoColor=white) | 2.13 | v2 写法（`model_dump()`） |
+| 业务数据库 | ![PostgreSQL](https://img.shields.io/badge/PostgreSQL-4169E1?style=flat&logo=postgresql&logoColor=white) | 16+ | |
+| 缓存 / 会话 / 限流 | ![Redis](https://img.shields.io/badge/Redis-DC382D?style=flat&logo=redis&logoColor=white) | 8+ / Stack | checkpointer 依赖 RediSearch + RedisJSON |
+| 向量库（长期记忆） | ![Milvus](https://img.shields.io/badge/Milvus-00A1F0?style=flat&logo=milvus&logoColor=white) | 2.6+ / pymilvus 3.x | 新代码用 `MilvusClient`，不用已弃用的 ORM 写法 |
+| 消息队列 | ![RabbitMQ](https://img.shields.io/badge/RabbitMQ-FF6600?style=flat&logo=rabbitmq&logoColor=white) | 4.x | quorum 队列不支持 `x-max-priority` |
+
+**协议层**（第 1 章）：
+
+- **MCP**（Model Context Protocol）——Agent 连**工具与上下文**，2025-12 起由 Linux Foundation 的 Agentic AI Foundation 托管；
+- **A2A**（Agent2Agent）——Agent 连 **Agent**，规范基线 1.0.0（校对 2026-09）。
+
+两者互补而非竞品："MCP 连工具、A2A 连 Agent"。
+
+> [!NOTE]
+> **示例中的模型与单价只作占位。** 模型生命周期很短——例如 `gpt-4o` 已于 2026-02 从 ChatGPT 退役、Azure 侧 2026-10-01 退役——手册里的模型 ID（`gpt-5.1` / `gpt-5-mini` / `claude-sonnet-4-6`）与价格请在上线前对照厂商的模型生命周期页核对，并把模型 ID 收敛到配置里，不要散落在业务代码中。
 
 ---
 
@@ -228,7 +246,7 @@ docs/
 
 | | |
 |:---:|:---|
-| ✍️ **作者** | Andy Yanqi Wang (ADW-19) · 中国上海 |
+| ✍️ **作者** | ADW-19 · 中国上海 |
 | 📕 **小红书** | ID：`ADW_AI` |
 
 欢迎通过 Issue 提出建议、勘误，或直接提交 PR。
