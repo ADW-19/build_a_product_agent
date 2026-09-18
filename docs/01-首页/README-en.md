@@ -8,6 +8,10 @@
 
 <br/>
 
+**🌐 [English](./README-en.md) · [简体中文](./README.md)**
+
+<br/>
+
 **✍️ Author: [ADW-19](https://github.com/ADW-19) · Lujiazui, Pudong New Area, Shanghai, China · RedNote: `ADW_AI`**
 
 <br/>
@@ -15,7 +19,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 [![GitHub Stars](https://img.shields.io/github/stars/ADW-19/build_a_product_agent?style=flat&logo=github&color=yellow)](https://github.com/ADW-19/build_a_product_agent/stargazers)
 [![Last Commit](https://img.shields.io/github/last-commit/ADW-19/build_a_product_agent?logo=git&color=orange)](https://github.com/ADW-19/build_a_product_agent/commits/main)
-[![Docs](https://img.shields.io/badge/Docs-Simplified%20Chinese-red?logo=markdown&logoColor=white)](./README.md)
+[![简体中文](https://img.shields.io/badge/README-简体中文-red?logo=readme&logoColor=white)](./README.md)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/ADW-19/build_a_product_agent/pulls)
 
 <br/>
@@ -28,6 +32,8 @@
 
 > [!IMPORTANT]
 > **Version Note**: This documentation is based on the author's hands-on development experience and will be updated from time to time. As the author's native language is Chinese, it primarily serves technical professionals in Mainland China, Hong Kong, Macau, Taiwan, Singapore, and other regions. A full English edition may be considered in the future if there is significant international interest.
+>
+> 🌐 中文读者：请从[中文版落地页](./README.md)开始阅读。
 
 ---
 

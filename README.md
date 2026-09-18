@@ -8,6 +8,10 @@
 
 <br/>
 
+**🌐 [English](./README-en.md) · [简体中文](./README.md)**
+
+<br/>
+
 **✍️ 作者：[ADW-19](https://github.com/ADW-19) · 中国上海浦东新区，陆家嘴 · 小红书：`ADW_AI`**
 
 <br/>
@@ -15,7 +19,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 [![GitHub Stars](https://img.shields.io/github/stars/ADW-19/build_a_product_agent?style=flat&logo=github&color=yellow)](https://github.com/ADW-19/build_a_product_agent/stargazers)
 [![Last Commit](https://img.shields.io/github/last-commit/ADW-19/build_a_product_agent?logo=git&color=orange)](https://github.com/ADW-19/build_a_product_agent/commits/main)
-[![Docs](https://img.shields.io/badge/文档-简体中文-red?logo=markdown&logoColor=white)](./README.md)
+[![English](https://img.shields.io/badge/README-English-2f81f7?logo=readme&logoColor=white)](./README-en.md)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/ADW-19/build_a_product_agent/pulls)
 
 <br/>
@@ -23,6 +27,13 @@
 [快速开始](#快速开始) · [学习路线](#学习路线) · [内容总览](#内容总览) · [技术栈](#技术栈) · [English](./README-en.md)
 
 </div>
+
+---
+
+> [!IMPORTANT]
+> **版本说明**：本文档基于作者开发实战经验创作，将不定期持续更新。作者母语为中文，目前主要面向中国大陆、港澳台、新加坡等地区的技术人士；若国际读者需求较多，后续再考虑推出完整英文版。
+>
+> 🌐 English readers: start from the [English landing page](./README-en.md).
 
 ---
 
@@ -45,9 +56,6 @@
 | 🧪 **测试与运维并重** | 不止"怎么写"，还讲"怎么测"和"怎么运维" |
 
 > 🎯 **目标读者**：具备一定编程基础的开发者。全书以 **「工业界标准 → 为什么课堂不教 → 你应该怎么写」** 为叙事线。
-
-> [!IMPORTANT]
-> **版本说明**：本文档基于作者开发实战经验创作，将不定期持续更新。作者母语为中文，目前主要面向中国大陆、港澳台、新加坡等地区的技术人士；若国际读者需求较多，后续再考虑推出完整英文版。
 
 ---
 
