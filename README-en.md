@@ -86,7 +86,7 @@ pip install pyyaml
 python scripts/check_snippets.py
 ```
 
-> The manual's hard rule is "examples must run", so the repo ships a static gate: `scripts/check_snippets.py` extracts every fenced code block, runs a syntax check and YAML parse, and scans for deprecated API usage (`set_entry_point`, `create_react_agent`, `from langchain.retrievers`, passing `RedisSaver.from_conn_string` where an instance is expected, …). ERROR means the example itself is broken; WARN means it references a cross-file symbol from the `core/` skeleton that needs a human look. Keep ERROR at zero before committing.
+> The manual's hard rule is "examples must run", so the repo ships a static gate: `scripts/check_snippets.py` extracts every fenced code block and checks Python syntax, YAML parseability, and fence language tags, and scans for deprecated API usage (`set_entry_point`, `create_react_agent`, `from langchain.retrievers`, passing `RedisSaver.from_conn_string` where an instance is expected, …). It only reports what is unambiguously wrong — no advisory warnings. Keep it at zero problems before committing.
 
 ---
 

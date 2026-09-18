@@ -84,7 +84,7 @@ pip install pyyaml
 python scripts/check_snippets.py
 ```
 
-> 手册的硬约定是"示例代码能跑"，所以仓库带一个静态校验闸门：`scripts/check_snippets.py` 会把所有代码块抽出来跑语法检查、YAML 解析，并扫描已弃用 API（`set_entry_point`、`create_react_agent`、`from langchain.retrievers`、`RedisSaver.from_conn_string` 当实例用……）。ERROR 表示示例本身有问题，WARN 表示引用了 `core/` 骨架里的跨文件符号、需要人工确认。提交前请保证 ERROR 为 0。
+> 手册的硬约定是"示例代码能跑"，所以仓库带一个静态校验闸门：`scripts/check_snippets.py` 会把所有代码块抽出来，检查 Python 语法、YAML 可解析性、围栏语言标注，并扫描已弃用 API（`set_entry_point`、`create_react_agent`、`from langchain.retrievers`、把 `RedisSaver.from_conn_string` 当实例用……）。它只报能明确定性的问题，不报"建议类"告警。提交前请保证 0 个问题。
 
 ---
 
