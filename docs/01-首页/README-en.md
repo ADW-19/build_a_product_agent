@@ -31,7 +31,7 @@
 ---
 
 > [!IMPORTANT]
-> **Version Note**: This documentation is based on the author's hands-on development experience and will be updated from time to time. As the author's native language is Chinese, it primarily serves technical professionals in Mainland China, Hong Kong, Macau, Taiwan, Singapore, and other regions. A full English edition may be considered in the future if there is significant international interest.
+> **Version Note**: This documentation is based on the author's hands-on development experience and will be updated from time to time. As the author's native language is Chinese, it primarily targets readers in Chinese-speaking regions (Mainland China, Hong Kong, Macau, Taiwan) as well as countries such as Singapore. A full English edition may be considered in the future if there is significant international interest.
 >
 > 🌐 中文读者：请从[中文版落地页](./README.md)开始阅读。
 
